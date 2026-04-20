@@ -1,0 +1,1866 @@
+#!/usr/bin/env python3
+"""
+SQLite Database for PDF Extraction Jobs
+Tracks all processing jobs with full history
+"""
+
+import sqlite3
+import json
+import logging
+from pathlib import Path
+from datetime import datetime
+from typing import Dict, List, Optional
+import hashlib
+import bcrypt
+
+logger = logging.getLogger(__name__)
+
+# Database file location
+DB_PATH = Path(__file__).parent / "data" / "extraction_history.db"
+
+# Connection timeout (seconds) — higher for concurrent users
+DB_TIMEOUT = 30.0
+
+
+def _connect():
+    """Create a database connection with proper settings for concurrent access."""
+    conn = sqlite3.connect(DB_PATH, timeout=DB_TIMEOUT)
+    conn.execute("PRAGMA journal_mode = WAL")
+    conn.execute("PRAGMA synchronous = NORMAL")
+    conn.execute("PRAGMA foreign_keys = ON")
+    conn.execute("PRAGMA cache_size = -64000")
+    conn.execute("PRAGMA busy_timeout = 30000")  # 30s wait on lock instead of failing
+    return conn
+
+def init_database():
+    """Initialize SQLite database with tables"""
+
+    # Ensure data directory exists
+    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+
+    conn = _connect()
+    cursor = conn.cursor()
+
+    # Jobs table - one row per PDF processed
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS jobs (
+            job_id TEXT PRIMARY KEY,
+            pdf_name TEXT NOT NULL,
+            pdf_hash TEXT NOT NULL,
+            pdf_path TEXT,
+            pdf_size INTEGER,
+            total_pages INTEGER,
+            text_pages INTEGER,
+            image_pages INTEGER,
+            status TEXT NOT NULL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            completed_at TIMESTAMP,
+            processing_time_seconds REAL,
+            cost_usd REAL,
+            accuracy_percent REAL,
+            error_message TEXT
+        )
+    """)
+
+    # Add pdf_path column if missing (migration for existing DBs)
+    try:
+        cursor.execute("ALTER TABLE jobs ADD COLUMN pdf_path TEXT")
+    except Exception:
+        pass  # Column already exists
+
+    # Items table - extracted data items FORMAT 1 (6 fields - linked to jobs)
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS items (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            job_id TEXT NOT NULL,
+            item_name TEXT,
+            customs_duty_rate REAL,
+            quantity TEXT,
+            invoice_unit_price TEXT,
+            commercial_tax_percent REAL,
+            exchange_rate TEXT,
+            hs_code TEXT,
+            origin_country TEXT,
+            customs_value_mmk REAL,
+            is_valid INTEGER DEFAULT 1,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (job_id) REFERENCES jobs(job_id)
+        )
+    """)
+
+    # Declaration table - extracted data FORMAT 2 (16 fields - linked to jobs)
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS declarations (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            job_id TEXT NOT NULL,
+            declaration_no TEXT,
+            declaration_date TEXT,
+            importer_name TEXT,
+            consignor_name TEXT,
+            invoice_number TEXT,
+            invoice_price REAL,
+            currency TEXT,
+            exchange_rate REAL,
+            currency_2 TEXT,
+            total_customs_value REAL,
+            import_export_customs_duty REAL,
+            commercial_tax_ct REAL,
+            advance_income_tax_at REAL,
+            security_fee_sf REAL,
+            maccs_service_fee_mf REAL,
+            exemption_reduction REAL,
+            is_valid INTEGER DEFAULT 1,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (job_id) REFERENCES jobs(job_id)
+        )
+    """)
+
+    # Processing logs - detailed step logs
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS processing_logs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            job_id TEXT NOT NULL,
+            step_number INTEGER,
+            step_name TEXT,
+            status TEXT,
+            message TEXT,
+            duration_seconds REAL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (job_id) REFERENCES jobs(job_id)
+        )
+    """)
+
+    # PDF metadata - store full PDF info
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS pdf_metadata (
+            job_id TEXT PRIMARY KEY,
+            pdf_path TEXT,
+            metadata_json TEXT,
+            FOREIGN KEY (job_id) REFERENCES jobs(job_id)
+        )
+    """)
+
+    # Users table — authentication and role management
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS users (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            username TEXT UNIQUE NOT NULL,
+            password_hash TEXT NOT NULL,
+            display_name TEXT,
+            role TEXT NOT NULL DEFAULT 'user',
+            is_active INTEGER DEFAULT 1,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            last_login TIMESTAMP
+        )
+    """)
+
+    # Activity logs — tracks who did what
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS activity_logs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER,
+            username TEXT NOT NULL,
+            action TEXT NOT NULL,
+            detail TEXT,
+            ip_address TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (user_id) REFERENCES users(id)
+        )
+    """)
+
+    # Page contents — stores raw text per page for search/RAG
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS page_contents (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            job_id TEXT NOT NULL,
+            user_id INTEGER,
+            pdf_name TEXT,
+            page_number INTEGER NOT NULL,
+            page_type TEXT,
+            source_agent TEXT,
+            content TEXT,
+            char_count INTEGER DEFAULT 0,
+            has_tables INTEGER DEFAULT 0,
+            has_numbers INTEGER DEFAULT 0,
+            ocr_status TEXT,
+            skip INTEGER DEFAULT 0,
+            filter_reason TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (job_id) REFERENCES jobs(job_id),
+            FOREIGN KEY (user_id) REFERENCES users(id)
+        )
+    """)
+
+    # FTS5 virtual table for full-text search on page content
+    try:
+        cursor.execute("""
+            CREATE VIRTUAL TABLE IF NOT EXISTS page_contents_fts USING fts5(
+                content,
+                pdf_name,
+                content='page_contents',
+                content_rowid='id',
+                tokenize='porter unicode61'
+            )
+        """)
+    except Exception:
+        pass  # FTS5 already exists or not supported
+
+    # Add user_id to jobs (migration for existing DBs)
+    try:
+        cursor.execute("ALTER TABLE jobs ADD COLUMN user_id INTEGER")
+    except Exception:
+        pass
+    try:
+        cursor.execute("ALTER TABLE jobs ADD COLUMN username TEXT")
+    except Exception:
+        pass
+
+    # Settings table — key-value store for app configuration
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS settings (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            updated_by TEXT
+        )
+    """)
+
+    # Keycloak migration: add keycloak_id and email to users
+    try:
+        cursor.execute("ALTER TABLE users ADD COLUMN keycloak_id TEXT UNIQUE")
+    except Exception:
+        pass
+    try:
+        cursor.execute("ALTER TABLE users ADD COLUMN email TEXT")
+    except Exception:
+        pass
+
+    # Create default admin if no users exist
+    cursor.execute("SELECT COUNT(*) FROM users")
+    if cursor.fetchone()[0] == 0:
+        import os
+        default_user = os.getenv("ADMIN_DEFAULT_USERNAME", "admin")
+        default_pw = os.getenv("ADMIN_DEFAULT_PASSWORD", "admin123")
+        admin_hash = bcrypt.hashpw(default_pw.encode(), bcrypt.gensalt()).decode()
+        cursor.execute("""
+            INSERT INTO users (username, password_hash, display_name, role)
+            VALUES (?, ?, 'Administrator', 'admin')
+        """, (default_user, admin_hash))
+        logger.info(f"Created default admin user: {default_user}")
+
+    # Groups table — RBAC permission groups
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS groups (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT UNIQUE NOT NULL,
+            description TEXT DEFAULT '',
+            page_agent INTEGER DEFAULT 1,
+            page_history INTEGER DEFAULT 1,
+            page_items INTEGER DEFAULT 1,
+            page_declarations INTEGER DEFAULT 1,
+            page_costs INTEGER DEFAULT 1,
+            page_settings INTEGER DEFAULT 0,
+            action_run_pipeline INTEGER DEFAULT 1,
+            action_upload_pdf INTEGER DEFAULT 1,
+            action_download_excel INTEGER DEFAULT 1,
+            action_delete_jobs INTEGER DEFAULT 0,
+            action_export_data INTEGER DEFAULT 1,
+            data_scope TEXT DEFAULT 'own',
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+
+    # User-group assignments (many-to-many)
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS user_groups (
+            user_id INTEGER NOT NULL,
+            group_id INTEGER NOT NULL,
+            assigned_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            assigned_by TEXT,
+            PRIMARY KEY (user_id, group_id),
+            FOREIGN KEY (user_id) REFERENCES users(id),
+            FOREIGN KEY (group_id) REFERENCES groups(id) ON DELETE CASCADE
+        )
+    """)
+
+    # Create default "Users" group if no groups exist
+    cursor.execute("SELECT COUNT(*) FROM groups")
+    if cursor.fetchone()[0] == 0:
+        cursor.execute("""
+            INSERT INTO groups (name, description, page_agent, page_history, page_items,
+                page_declarations, page_costs, page_settings, action_run_pipeline,
+                action_upload_pdf, action_download_excel, action_delete_jobs,
+                action_export_data, data_scope)
+            VALUES ('Users', 'Default group for all users', 1, 1, 1, 1, 1, 0, 1, 1, 1, 0, 1, 'own')
+        """)
+        logger.info("Created default 'Users' group (no settings access, no delete)")
+
+    # Page extractions table — v2 per-page structured data
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS page_extractions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            job_id TEXT NOT NULL,
+            page_number INTEGER NOT NULL,
+            page_type TEXT,
+            language TEXT,
+            confidence REAL,
+            explanation TEXT,
+            doc_title TEXT,
+            doc_issuer TEXT,
+            doc_date TEXT,
+            doc_reference TEXT,
+            doc_country TEXT,
+            fields_json TEXT,
+            items_json TEXT,
+            amounts_json TEXT,
+            entities_json TEXT,
+            has_logo INTEGER DEFAULT 0,
+            has_stamp INTEGER DEFAULT 0,
+            has_signature INTEGER DEFAULT 0,
+            has_barcode INTEGER DEFAULT 0,
+            visual_quality TEXT,
+            raw_char_count INTEGER DEFAULT 0,
+            orientation TEXT,
+            pipeline_version TEXT DEFAULT 'v2',
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (job_id) REFERENCES jobs(job_id)
+        )
+    """)
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_page_ext_job ON page_extractions(job_id)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_page_ext_type ON page_extractions(page_type)")
+
+    # Add pipeline_version to jobs table
+    try:
+        cursor.execute("ALTER TABLE jobs ADD COLUMN pipeline_version TEXT DEFAULT 'v1'")
+    except Exception:
+        pass
+
+    # Add cross_validation_json to jobs table
+    try:
+        cursor.execute("ALTER TABLE jobs ADD COLUMN cross_validation_json TEXT")
+    except Exception:
+        pass
+
+    # Importer profiles — learned patterns per importer
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS importer_profiles (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            importer_name TEXT NOT NULL,
+            importer_name_normalized TEXT NOT NULL,
+            currency TEXT,
+            exchange_rate_min REAL,
+            exchange_rate_max REAL,
+            exchange_rate_avg REAL,
+            common_consignor TEXT,
+            common_items TEXT,
+            total_jobs INTEGER DEFAULT 0,
+            last_job_date TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+    try:
+        cursor.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_importer_normalized ON importer_profiles(importer_name_normalized)")
+    except Exception:
+        pass
+
+    # Field accuracy tracker — which fields fail per importer
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS field_accuracy (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            importer_name_normalized TEXT NOT NULL,
+            field_key TEXT NOT NULL,
+            total_extractions INTEGER DEFAULT 0,
+            corrections_count INTEGER DEFAULT 0,
+            last_correction_at TEXT,
+            UNIQUE(importer_name_normalized, field_key)
+        )
+    """)
+
+    # Value audit trail — tracks every change to an extracted value
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS value_audit (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            job_id TEXT NOT NULL,
+            table_key TEXT NOT NULL,
+            field_key TEXT NOT NULL,
+            item_index INTEGER,
+            stage TEXT NOT NULL,
+            old_value TEXT,
+            new_value TEXT,
+            source TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (job_id) REFERENCES jobs(job_id)
+        )
+    """)
+
+    # Create indexes for faster queries
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_jobs_created ON jobs(created_at DESC)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_jobs_status ON jobs(status)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_jobs_user ON jobs(user_id)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_items_job ON items(job_id)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_declarations_job ON declarations(job_id)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_logs_job ON processing_logs(job_id)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_users_username ON users(username)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_activity_created ON activity_logs(created_at DESC)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_activity_user ON activity_logs(user_id)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_pages_job ON page_contents(job_id)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_pages_user ON page_contents(user_id)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_pages_pdf ON page_contents(pdf_name)")
+
+    # Clean up stale PROCESSING jobs from previous crashes/restarts
+    cursor.execute("""
+        UPDATE jobs SET status = 'FAILED', error_message = 'Server restarted during processing'
+        WHERE status = 'PROCESSING'
+    """)
+    stale = cursor.rowcount
+    if stale:
+        logger.info(f"Cleaned up {stale} stale PROCESSING job(s)")
+
+    # Add new item columns if not exist (for existing DBs)
+    try:
+        cursor.execute("ALTER TABLE items ADD COLUMN hs_code TEXT")
+    except Exception:
+        pass
+    try:
+        cursor.execute("ALTER TABLE items ADD COLUMN origin_country TEXT")
+    except Exception:
+        pass
+    try:
+        cursor.execute("ALTER TABLE items ADD COLUMN customs_value_mmk REAL")
+    except Exception:
+        pass
+
+    # Corrections table — stores user corrections for self-learning
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS corrections (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            job_id TEXT NOT NULL,
+            profile_id INTEGER DEFAULT 1,
+            table_key TEXT NOT NULL,
+            field_key TEXT NOT NULL,
+            item_index INTEGER,
+            original_value TEXT,
+            corrected_value TEXT NOT NULL,
+            correction_type TEXT DEFAULT 'wrong_value',
+            page_source INTEGER,
+            raw_text_context TEXT,
+            user_id INTEGER,
+            username TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+
+    # Learning events — audit trail for auto-generated rules
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS learning_events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            profile_id INTEGER DEFAULT 1,
+            event_type TEXT NOT NULL,
+            event_data TEXT,
+            trigger_correction_id INTEGER,
+            corrections_analyzed INTEGER,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+
+    # Indexes for corrections
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_corrections_job ON corrections(job_id)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_corrections_profile ON corrections(profile_id)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_corrections_field ON corrections(table_key, field_key)")
+
+    conn.commit()
+    conn.close()
+
+    print(f"✅ Database initialized: {DB_PATH}")
+
+def generate_job_id(pdf_name: str) -> str:
+    """Generate unique job ID"""
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    return f"JOB_{timestamp}_{pdf_name[:20].replace(' ', '_')}"
+
+def calculate_pdf_hash(pdf_path: str) -> str:
+    """Calculate SHA256 hash of PDF file for duplicate detection."""
+    try:
+        with open(pdf_path, 'rb') as f:
+            return hashlib.sha256(f.read()).hexdigest()
+    except Exception as e:
+        logger.warning(f"PDF hash calculation failed: {e}")
+        return ""
+
+def create_job(pdf_name: str, pdf_path: str, pdf_size: int, total_pages: int,
+               text_pages: int, image_pages: int, user_id: int = None, username: str = None) -> str:
+    """Create a new processing job linked to a user"""
+
+    job_id = generate_job_id(pdf_name)
+    pdf_hash = calculate_pdf_hash(pdf_path)
+
+    conn = _connect()
+    cursor = conn.cursor()
+
+    cursor.execute("""
+        INSERT INTO jobs (job_id, pdf_name, pdf_hash, pdf_path, pdf_size, total_pages,
+                         text_pages, image_pages, status, user_id, username)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'PROCESSING', ?, ?)
+    """, (job_id, pdf_name, pdf_hash, pdf_path, pdf_size, total_pages, text_pages, image_pages, user_id, username))
+
+    conn.commit()
+    conn.close()
+
+    print(f"✅ Created job: {job_id}")
+    return job_id
+
+def update_job_status(job_id: str, status: str, error_message: str = None):
+    """Update job status"""
+
+    conn = _connect()
+    cursor = conn.cursor()
+
+    if status == 'COMPLETED':
+        cursor.execute("""
+            UPDATE jobs
+            SET status = ?, completed_at = CURRENT_TIMESTAMP, error_message = ?
+            WHERE job_id = ?
+        """, (status, error_message, job_id))
+    else:
+        cursor.execute("""
+            UPDATE jobs
+            SET status = ?, error_message = ?
+            WHERE job_id = ?
+        """, (status, error_message, job_id))
+
+    conn.commit()
+    conn.close()
+
+def update_job_metrics(job_id: str, processing_time: float, cost: float, accuracy: float):
+    """Update job metrics"""
+
+    conn = _connect()
+    cursor = conn.cursor()
+
+    cursor.execute("""
+        UPDATE jobs
+        SET processing_time_seconds = ?, cost_usd = ?, accuracy_percent = ?
+        WHERE job_id = ?
+    """, (processing_time, cost, accuracy, job_id))
+
+    conn.commit()
+    conn.close()
+
+def save_items(job_id: str, items: List[Dict]):
+    """Save extracted items to database"""
+
+    conn = _connect()
+    cursor = conn.cursor()
+
+    for item in items:
+        cursor.execute("""
+            INSERT INTO items (job_id, item_name, customs_duty_rate, quantity,
+                             invoice_unit_price, commercial_tax_percent, exchange_rate,
+                             hs_code, origin_country, customs_value_mmk)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            job_id,
+            item.get('Item name', ''),
+            item.get('Customs duty rate', 0.0),
+            item.get('Quantity (1)', ''),
+            item.get('Invoice unit price', ''),
+            item.get('Commercial tax %', 0.0),
+            item.get('Exchange Rate (1)', ''),
+            item.get('HS Code', ''),
+            item.get('Origin Country', ''),
+            item.get('Customs Value (MMK)', 0.0),
+        ))
+
+    conn.commit()
+    conn.close()
+
+    print(f"✅ Saved {len(items)} items for job {job_id}")
+
+def save_declarations(job_id: str, declarations: List[Dict]):
+    """Save extracted declarations (Format 2) to database"""
+
+    conn = _connect()
+    cursor = conn.cursor()
+
+    for decl in declarations:
+        cursor.execute("""
+            INSERT INTO declarations (
+                job_id, declaration_no, declaration_date, importer_name, consignor_name,
+                invoice_number, invoice_price, currency, exchange_rate, currency_2,
+                total_customs_value, import_export_customs_duty, commercial_tax_ct,
+                advance_income_tax_at, security_fee_sf, maccs_service_fee_mf, exemption_reduction
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            job_id,
+            decl.get('Declaration No', ''),
+            decl.get('Declaration Date', ''),
+            decl.get('Importer (Name)', ''),
+            decl.get('Consignor (Name)', ''),
+            decl.get('Invoice Number', ''),
+            decl.get('Invoice Price', 0.0),
+            decl.get('Currency', ''),
+            decl.get('Exchange Rate', 0.0),
+            decl.get('Currency.1', ''),
+            decl.get('Total Customs Value', 0.0),
+            decl.get('Import/Export Customs Duty', 0.0),
+            decl.get('Commercial Tax (CT)', 0.0),
+            decl.get('Advance Income Tax (AT)', 0.0),
+            decl.get('Security Fee (SF)', 0.0),
+            decl.get('MACCS Service Fee (MF)', 0.0),
+            decl.get('Exemption/Reduction', 0.0)
+        ))
+
+    conn.commit()
+    conn.close()
+
+    print(f"✅ Saved {len(declarations)} declarations for job {job_id}")
+
+def save_pdf_metadata(job_id: str, metadata: Dict):
+    """Save PDF metadata JSON"""
+
+    conn = _connect()
+    cursor = conn.cursor()
+
+    cursor.execute("""
+        INSERT OR REPLACE INTO pdf_metadata (job_id, pdf_path, metadata_json)
+        VALUES (?, ?, ?)
+    """, (job_id, metadata.get('pdf_path', ''), json.dumps(metadata)))
+
+    conn.commit()
+    conn.close()
+
+def log_processing_step(job_id: str, step_number: int, step_name: str,
+                       status: str, message: str = "", duration: float = 0.0):
+    """Log a processing step"""
+
+    conn = _connect()
+    cursor = conn.cursor()
+
+    cursor.execute("""
+        INSERT INTO processing_logs (job_id, step_number, step_name, status, message, duration_seconds)
+        VALUES (?, ?, ?, ?, ?, ?)
+    """, (job_id, step_number, step_name, status, message, duration))
+
+    conn.commit()
+    conn.close()
+
+def get_all_jobs(limit: int = 50) -> List[Dict]:
+    """Get all jobs (most recent first)"""
+
+    conn = _connect()
+    conn.row_factory = sqlite3.Row
+    cursor = conn.cursor()
+
+    cursor.execute("""
+        SELECT * FROM jobs
+        ORDER BY created_at DESC
+        LIMIT ?
+    """, (limit,))
+
+    jobs = [dict(row) for row in cursor.fetchall()]
+    conn.close()
+
+    return jobs
+
+def get_job_items(job_id: str) -> List[Dict]:
+    """Get all items for a job"""
+
+    conn = _connect()
+    conn.row_factory = sqlite3.Row
+    cursor = conn.cursor()
+
+    cursor.execute("""
+        SELECT * FROM items
+        WHERE job_id = ?
+        ORDER BY id
+    """, (job_id,))
+
+    items = [dict(row) for row in cursor.fetchall()]
+    conn.close()
+
+    return items
+
+def get_job_declarations(job_id: str) -> List[Dict]:
+    """Get all declarations for a job (Format 2)"""
+
+    conn = _connect()
+    conn.row_factory = sqlite3.Row
+    cursor = conn.cursor()
+
+    cursor.execute("""
+        SELECT * FROM declarations
+        WHERE job_id = ?
+        ORDER BY id
+    """, (job_id,))
+
+    declarations = [dict(row) for row in cursor.fetchall()]
+    conn.close()
+
+    return declarations
+
+def get_job_logs(job_id: str) -> List[Dict]:
+    """Get processing logs for a job"""
+
+    conn = _connect()
+    conn.row_factory = sqlite3.Row
+    cursor = conn.cursor()
+
+    cursor.execute("""
+        SELECT * FROM processing_logs
+        WHERE job_id = ?
+        ORDER BY step_number
+    """, (job_id,))
+
+    logs = [dict(row) for row in cursor.fetchall()]
+    conn.close()
+
+    return logs
+
+def get_job_details(job_id: str) -> Optional[Dict]:
+    """Get complete job details"""
+
+    conn = _connect()
+    conn.row_factory = sqlite3.Row
+    cursor = conn.cursor()
+
+    # Get job info
+    cursor.execute("SELECT * FROM jobs WHERE job_id = ?", (job_id,))
+    job = cursor.fetchone()
+
+    if not job:
+        conn.close()
+        return None
+
+    job_dict = dict(job)
+
+    # Get items (Format 1)
+    cursor.execute("SELECT * FROM items WHERE job_id = ?", (job_id,))
+    job_dict['items'] = [dict(row) for row in cursor.fetchall()]
+
+    # Get declarations (Format 2)
+    cursor.execute("SELECT * FROM declarations WHERE job_id = ?", (job_id,))
+    job_dict['declarations'] = [dict(row) for row in cursor.fetchall()]
+
+    # Get logs
+    cursor.execute("SELECT * FROM processing_logs WHERE job_id = ?", (job_id,))
+    job_dict['logs'] = [dict(row) for row in cursor.fetchall()]
+
+    # Get metadata
+    cursor.execute("SELECT metadata_json FROM pdf_metadata WHERE job_id = ?", (job_id,))
+    metadata_row = cursor.fetchone()
+    if metadata_row:
+        job_dict['pdf_metadata'] = json.loads(metadata_row['metadata_json'])
+
+    # Parse cross_validation JSON if present
+    if job_dict.get('cross_validation_json'):
+        try:
+            job_dict['cross_validation'] = json.loads(job_dict['cross_validation_json'])
+        except (json.JSONDecodeError, TypeError):
+            job_dict['cross_validation'] = None
+    else:
+        job_dict['cross_validation'] = None
+
+    conn.close()
+    return job_dict
+
+def get_stats() -> Dict:
+    """Get database statistics"""
+
+    conn = _connect()
+    cursor = conn.cursor()
+
+    # Total jobs
+    cursor.execute("SELECT COUNT(*) FROM jobs")
+    total_jobs = cursor.fetchone()[0]
+
+    # Completed jobs
+    cursor.execute("SELECT COUNT(*) FROM jobs WHERE status = 'COMPLETED'")
+    completed_jobs = cursor.fetchone()[0]
+
+    # Failed jobs
+    cursor.execute("SELECT COUNT(*) FROM jobs WHERE status = 'FAILED'")
+    failed_jobs = cursor.fetchone()[0]
+
+    # Total items extracted (Format 1)
+    cursor.execute("SELECT COUNT(*) FROM items")
+    total_items = cursor.fetchone()[0]
+
+    # Total declarations extracted (Format 2)
+    cursor.execute("SELECT COUNT(*) FROM declarations")
+    total_declarations = cursor.fetchone()[0]
+
+    # Average accuracy
+    cursor.execute("SELECT AVG(accuracy_percent) FROM jobs WHERE status = 'COMPLETED'")
+    avg_accuracy = cursor.fetchone()[0] or 0.0
+
+    # Total cost
+    cursor.execute("SELECT SUM(cost_usd) FROM jobs WHERE status = 'COMPLETED'")
+    total_cost = cursor.fetchone()[0] or 0.0
+
+    conn.close()
+
+    return {
+        'total_jobs': total_jobs,
+        'completed_jobs': completed_jobs,
+        'failed_jobs': failed_jobs,
+        'total_items': total_items,
+        'total_declarations': total_declarations,
+        'avg_accuracy': avg_accuracy,
+        'total_cost': total_cost
+    }
+
+def find_job_by_hash(pdf_hash: str) -> Optional[Dict]:
+    """Find a completed job with the same PDF hash (duplicate detection)."""
+    if not pdf_hash:
+        return None
+
+    conn = _connect()
+    conn.row_factory = sqlite3.Row
+    cursor = conn.cursor()
+
+    cursor.execute("""
+        SELECT * FROM jobs
+        WHERE pdf_hash = ? AND status = 'COMPLETED'
+        ORDER BY created_at DESC
+        LIMIT 1
+    """, (pdf_hash,))
+
+    row = cursor.fetchone()
+    conn.close()
+
+    if row:
+        return dict(row)
+    return None
+
+
+def delete_job(job_id: str) -> bool:
+    """Delete a job and all related data."""
+    conn = _connect()
+    cursor = conn.cursor()
+    try:
+        cursor.execute("DELETE FROM processing_logs WHERE job_id = ?", (job_id,))
+        cursor.execute("DELETE FROM pdf_metadata WHERE job_id = ?", (job_id,))
+        cursor.execute("DELETE FROM items WHERE job_id = ?", (job_id,))
+        cursor.execute("DELETE FROM declarations WHERE job_id = ?", (job_id,))
+        cursor.execute("DELETE FROM jobs WHERE job_id = ?", (job_id,))
+        conn.commit()
+        conn.close()
+        return True
+    except Exception:
+        conn.close()
+        return False
+
+
+# =============================================================================
+# USER MANAGEMENT
+# =============================================================================
+
+def authenticate_user(username: str, password: str) -> Optional[Dict]:
+    """Authenticate user with bcrypt. Falls back to SHA256 for migration."""
+    conn = _connect()
+    conn.row_factory = sqlite3.Row
+    cursor = conn.cursor()
+
+    cursor.execute("SELECT * FROM users WHERE username = ? AND is_active = 1", (username,))
+    user = cursor.fetchone()
+
+    if not user:
+        conn.close()
+        return None
+
+    stored_hash = user['password_hash']
+    authenticated = False
+
+    # Try bcrypt first (new format)
+    if stored_hash.startswith('$2'):
+        try:
+            authenticated = bcrypt.checkpw(password.encode(), stored_hash.encode())
+        except Exception:
+            authenticated = False
+    else:
+        # Legacy SHA256 fallback — migrate to bcrypt on success
+        sha_hash = hashlib.sha256(password.encode()).hexdigest()
+        if sha_hash == stored_hash:
+            authenticated = True
+            new_hash = bcrypt.hashpw(password.encode(), bcrypt.gensalt()).decode()
+            cursor.execute("UPDATE users SET password_hash = ? WHERE id = ?", (new_hash, user['id']))
+            logger.info(f"Migrated user {username} password to bcrypt")
+
+    if authenticated:
+        cursor.execute("UPDATE users SET last_login = CURRENT_TIMESTAMP WHERE id = ?", (user['id'],))
+        conn.commit()
+        user_dict = dict(user)
+        conn.close()
+        return user_dict
+
+    conn.close()
+    return None
+
+
+def create_user(username: str, password: str, display_name: str, role: str = 'user') -> bool:
+    """Create a new user. Returns True on success."""
+    password_hash = bcrypt.hashpw(password.encode(), bcrypt.gensalt()).decode()
+
+    conn = _connect()
+    cursor = conn.cursor()
+
+    try:
+        cursor.execute("""
+            INSERT INTO users (username, password_hash, display_name, role)
+            VALUES (?, ?, ?, ?)
+        """, (username, password_hash, display_name, role))
+        conn.commit()
+        conn.close()
+        return True
+    except sqlite3.IntegrityError:
+        conn.close()
+        return False
+
+
+def get_all_users() -> List[Dict]:
+    """Get all users."""
+    conn = _connect()
+    conn.row_factory = sqlite3.Row
+    cursor = conn.cursor()
+    cursor.execute("SELECT id, username, display_name, role, is_active, created_at, last_login FROM users ORDER BY created_at")
+    users = [dict(row) for row in cursor.fetchall()]
+    conn.close()
+    return users
+
+
+def update_user(user_id: int, display_name: str = None, role: str = None, is_active: int = None, password: str = None):
+    """Update user fields."""
+    conn = _connect()
+    cursor = conn.cursor()
+
+    if display_name is not None:
+        cursor.execute("UPDATE users SET display_name = ? WHERE id = ?", (display_name, user_id))
+    if role is not None:
+        cursor.execute("UPDATE users SET role = ? WHERE id = ?", (role, user_id))
+    if is_active is not None:
+        cursor.execute("UPDATE users SET is_active = ? WHERE id = ?", (is_active, user_id))
+    if password is not None:
+        password_hash = bcrypt.hashpw(password.encode(), bcrypt.gensalt()).decode()
+        cursor.execute("UPDATE users SET password_hash = ? WHERE id = ?", (password_hash, user_id))
+
+    conn.commit()
+    conn.close()
+
+
+def delete_user(user_id: int) -> bool:
+    """Delete a user by ID."""
+    conn = _connect()
+    cursor = conn.cursor()
+    cursor.execute("DELETE FROM users WHERE id = ?", (user_id,))
+    deleted = cursor.rowcount > 0
+    conn.commit()
+    conn.close()
+    return deleted
+
+
+# =============================================================================
+# PAGE CONTENTS — RAG STORAGE
+# =============================================================================
+
+def save_page_contents(job_id: str, pdf_name: str, pages: List[Dict], user_id: int = None):
+    """Save page-by-page content to database and FTS index."""
+    conn = _connect()
+    cursor = conn.cursor()
+
+    for page in pages:
+        content = page.get('content', '')
+        has_tables = 1 if any(kw in content.lower() for kw in ['|', 'total', 'qty', 'amount', 'rate', 'price']) else 0
+        has_numbers = 1 if any(c.isdigit() for c in content) else 0
+
+        cursor.execute("""
+            INSERT INTO page_contents (job_id, user_id, pdf_name, page_number, page_type,
+                source_agent, content, char_count, has_tables, has_numbers,
+                ocr_status, skip, filter_reason)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            job_id, user_id, pdf_name,
+            page.get('page', 0),
+            page.get('type', ''),
+            page.get('source', ''),
+            content,
+            len(content),
+            has_tables, has_numbers,
+            page.get('ocr_status', ''),
+            1 if page.get('skip') else 0,
+            page.get('filter_reason', '')
+        ))
+
+        # Update FTS index
+        row_id = cursor.lastrowid
+        try:
+            cursor.execute("""
+                INSERT INTO page_contents_fts (rowid, content, pdf_name)
+                VALUES (?, ?, ?)
+            """, (row_id, content, pdf_name))
+        except Exception:
+            pass
+
+    conn.commit()
+    conn.close()
+    print(f"  Saved {len(pages)} pages for job {job_id}")
+
+
+def search_page_contents(query: str, user_id: int = None, pdf_name: str = None,
+                         page_type: str = None, limit: int = 100) -> List[Dict]:
+    """Full-text search across page contents."""
+    conn = _connect()
+    conn.row_factory = sqlite3.Row
+    cursor = conn.cursor()
+
+    if query and query.strip():
+        # FTS5 search
+        fts_query = ' OR '.join(query.strip().split())
+        sql = """
+            SELECT pc.*, highlight(page_contents_fts, 0, '**', '**') as snippet
+            FROM page_contents_fts fts
+            JOIN page_contents pc ON pc.id = fts.rowid
+            WHERE page_contents_fts MATCH ?
+        """
+        params = [fts_query]
+    else:
+        sql = "SELECT pc.*, '' as snippet FROM page_contents pc WHERE 1=1"
+        params = []
+
+    if user_id:
+        sql += " AND pc.user_id = ?"
+        params.append(user_id)
+    if pdf_name and pdf_name != "All PDFs":
+        sql += " AND pc.pdf_name = ?"
+        params.append(pdf_name)
+    if page_type and page_type != "All Types":
+        sql += " AND pc.page_type = ?"
+        params.append(page_type)
+
+    sql += " ORDER BY pc.created_at DESC, pc.page_number ASC LIMIT ?"
+    params.append(limit)
+
+    try:
+        cursor.execute(sql, params)
+        results = [dict(row) for row in cursor.fetchall()]
+    except Exception:
+        results = []
+
+    conn.close()
+    return results
+
+
+def get_all_page_contents(user_id: int = None, pdf_name: str = None,
+                          page_type: str = None, limit: int = 500) -> List[Dict]:
+    """Get all page contents with optional filters."""
+    conn = _connect()
+    conn.row_factory = sqlite3.Row
+    cursor = conn.cursor()
+
+    sql = "SELECT * FROM page_contents WHERE skip = 0"
+    params = []
+
+    if user_id:
+        sql += " AND user_id = ?"
+        params.append(user_id)
+    if pdf_name and pdf_name != "All PDFs":
+        sql += " AND pdf_name = ?"
+        params.append(pdf_name)
+    if page_type and page_type != "All Types":
+        sql += " AND page_type = ?"
+        params.append(page_type)
+
+    sql += " ORDER BY created_at DESC, page_number ASC LIMIT ?"
+    params.append(limit)
+
+    cursor.execute(sql, params)
+    results = [dict(row) for row in cursor.fetchall()]
+    conn.close()
+    return results
+
+
+def get_page_content_pdfs(user_id: int = None) -> List[str]:
+    """Get list of PDF names that have stored page content."""
+    conn = _connect()
+    cursor = conn.cursor()
+
+    if user_id:
+        cursor.execute("SELECT DISTINCT pdf_name FROM page_contents WHERE user_id = ? ORDER BY pdf_name", (user_id,))
+    else:
+        cursor.execute("SELECT DISTINCT pdf_name FROM page_contents ORDER BY pdf_name")
+
+    pdfs = [row[0] for row in cursor.fetchall()]
+    conn.close()
+    return pdfs
+
+
+def get_page_content_stats(user_id: int = None) -> Dict:
+    """Get stats for stored page contents."""
+    conn = _connect()
+    cursor = conn.cursor()
+
+    if user_id:
+        cursor.execute("SELECT COUNT(*) FROM page_contents WHERE user_id = ?", (user_id,))
+        total_pages = cursor.fetchone()[0]
+        cursor.execute("SELECT COUNT(DISTINCT pdf_name) FROM page_contents WHERE user_id = ?", (user_id,))
+        total_pdfs = cursor.fetchone()[0]
+        cursor.execute("SELECT SUM(char_count) FROM page_contents WHERE user_id = ?", (user_id,))
+        total_chars = cursor.fetchone()[0] or 0
+        cursor.execute("SELECT COUNT(*) FROM page_contents WHERE user_id = ? AND page_type = 'TEXT'", (user_id,))
+        text_pages = cursor.fetchone()[0]
+        cursor.execute("SELECT COUNT(*) FROM page_contents WHERE user_id = ? AND page_type = 'IMAGE'", (user_id,))
+        image_pages = cursor.fetchone()[0]
+    else:
+        cursor.execute("SELECT COUNT(*) FROM page_contents")
+        total_pages = cursor.fetchone()[0]
+        cursor.execute("SELECT COUNT(DISTINCT pdf_name) FROM page_contents")
+        total_pdfs = cursor.fetchone()[0]
+        cursor.execute("SELECT SUM(char_count) FROM page_contents")
+        total_chars = cursor.fetchone()[0] or 0
+        cursor.execute("SELECT COUNT(*) FROM page_contents WHERE page_type = 'TEXT'")
+        text_pages = cursor.fetchone()[0]
+        cursor.execute("SELECT COUNT(*) FROM page_contents WHERE page_type = 'IMAGE'")
+        image_pages = cursor.fetchone()[0]
+
+    conn.close()
+    return {
+        'total_pages': total_pages,
+        'total_pdfs': total_pdfs,
+        'total_chars': total_chars,
+        'text_pages': text_pages,
+        'image_pages': image_pages
+    }
+
+
+# =============================================================================
+# ACTIVITY LOGGING
+# =============================================================================
+
+def log_activity(user_id: int, username: str, action: str, detail: str = ""):
+    """Log a user activity."""
+    conn = _connect()
+    cursor = conn.cursor()
+    cursor.execute("""
+        INSERT INTO activity_logs (user_id, username, action, detail)
+        VALUES (?, ?, ?, ?)
+    """, (user_id, username, action, detail))
+    conn.commit()
+    conn.close()
+
+
+def get_activity_logs(limit: int = 200, user_id: int = None) -> List[Dict]:
+    """Get activity logs. Optionally filter by user."""
+    conn = _connect()
+    conn.row_factory = sqlite3.Row
+    cursor = conn.cursor()
+
+    if user_id:
+        cursor.execute("""
+            SELECT * FROM activity_logs WHERE user_id = ?
+            ORDER BY created_at DESC LIMIT ?
+        """, (user_id, limit))
+    else:
+        cursor.execute("""
+            SELECT * FROM activity_logs
+            ORDER BY created_at DESC LIMIT ?
+        """, (limit,))
+
+    logs = [dict(row) for row in cursor.fetchall()]
+    conn.close()
+    return logs
+
+
+# =============================================================================
+# PER-USER QUERIES
+# =============================================================================
+
+def get_user_jobs(user_id: int, limit: int = 100) -> List[Dict]:
+    """Get jobs for a specific user."""
+    conn = _connect()
+    conn.row_factory = sqlite3.Row
+    cursor = conn.cursor()
+
+    cursor.execute("""
+        SELECT * FROM jobs WHERE user_id = ?
+        ORDER BY created_at DESC LIMIT ?
+    """, (user_id, limit))
+
+    jobs = [dict(row) for row in cursor.fetchall()]
+    conn.close()
+    return jobs
+
+
+def get_user_stats(user_id: int) -> Dict:
+    """Get stats for a specific user."""
+    conn = _connect()
+    cursor = conn.cursor()
+
+    cursor.execute("SELECT COUNT(*) FROM jobs WHERE user_id = ?", (user_id,))
+    total = cursor.fetchone()[0]
+
+    cursor.execute("SELECT COUNT(*) FROM jobs WHERE user_id = ? AND status = 'COMPLETED'", (user_id,))
+    completed = cursor.fetchone()[0]
+
+    cursor.execute("SELECT AVG(accuracy_percent) FROM jobs WHERE user_id = ? AND status = 'COMPLETED'", (user_id,))
+    avg_acc = cursor.fetchone()[0] or 0.0
+
+    cursor.execute("SELECT SUM(cost_usd) FROM jobs WHERE user_id = ? AND status = 'COMPLETED'", (user_id,))
+    total_cost = cursor.fetchone()[0] or 0.0
+
+    conn.close()
+    return {'total_jobs': total, 'completed_jobs': completed, 'avg_accuracy': avg_acc, 'total_cost': total_cost}
+
+
+# =============================================================================
+# SETTINGS — KEY-VALUE STORE
+# =============================================================================
+
+def get_setting(key: str) -> Optional[str]:
+    """Get a single setting value by key."""
+    conn = _connect()
+    cursor = conn.cursor()
+    cursor.execute("SELECT value FROM settings WHERE key = ?", (key,))
+    row = cursor.fetchone()
+    conn.close()
+    return row[0] if row else None
+
+
+def set_setting(key: str, value: str, updated_by: str = "system"):
+    """Set a single setting value (upsert)."""
+    conn = _connect()
+    cursor = conn.cursor()
+    cursor.execute("""
+        INSERT INTO settings (key, value, updated_at, updated_by)
+        VALUES (?, ?, CURRENT_TIMESTAMP, ?)
+        ON CONFLICT(key) DO UPDATE SET value = ?, updated_at = CURRENT_TIMESTAMP, updated_by = ?
+    """, (key, value, updated_by, value, updated_by))
+    conn.commit()
+    conn.close()
+
+
+def get_settings_by_prefix(prefix: str) -> Dict:
+    """Get all settings matching a prefix as a dict."""
+    conn = _connect()
+    conn.row_factory = sqlite3.Row
+    cursor = conn.cursor()
+    cursor.execute("SELECT key, value, updated_at, updated_by FROM settings WHERE key LIKE ?", (f"{prefix}%",))
+    rows = cursor.fetchall()
+    conn.close()
+    return {row["key"]: {"value": row["value"], "updated_at": row["updated_at"], "updated_by": row["updated_by"]} for row in rows}
+
+
+def delete_settings_by_prefix(prefix: str):
+    """Delete all settings matching a prefix."""
+    conn = _connect()
+    cursor = conn.cursor()
+    cursor.execute("DELETE FROM settings WHERE key LIKE ?", (f"{prefix}%",))
+    conn.commit()
+    conn.close()
+
+
+# =============================================================================
+# CORRECTIONS — Self-Learning
+# =============================================================================
+
+def save_correction(job_id: str, profile_id: int, table_key: str, field_key: str,
+                    item_index: int, original_value: str, corrected_value: str,
+                    correction_type: str = "wrong_value", user_id: int = None,
+                    username: str = None) -> int:
+    """Save a user correction. Returns correction id."""
+    conn = _connect()
+    conn.execute("PRAGMA foreign_keys = OFF")  # Corrections can reference any job_id
+    cursor = conn.cursor()
+    cursor.execute("""
+        INSERT INTO corrections (job_id, profile_id, table_key, field_key,
+            item_index, original_value, corrected_value, correction_type,
+            user_id, username)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """, (job_id, profile_id, table_key, field_key, item_index,
+          str(original_value), str(corrected_value), correction_type,
+          user_id, username))
+    correction_id = cursor.lastrowid
+    conn.commit()
+    conn.close()
+    return correction_id
+
+
+def get_corrections(profile_id: int = None, job_id: str = None,
+                    table_key: str = None, field_key: str = None,
+                    limit: int = 100) -> list:
+    """Query corrections with optional filters."""
+    conn = _connect()
+    query = "SELECT * FROM corrections WHERE 1=1"
+    params = []
+    if profile_id:
+        query += " AND profile_id = ?"
+        params.append(profile_id)
+    if job_id:
+        query += " AND job_id = ?"
+        params.append(job_id)
+    if table_key:
+        query += " AND table_key = ?"
+        params.append(table_key)
+    if field_key:
+        query += " AND field_key = ?"
+        params.append(field_key)
+    query += " ORDER BY created_at DESC LIMIT ?"
+    params.append(limit)
+    rows = conn.execute(query, params).fetchall()
+    conn.close()
+    columns = ["id", "job_id", "profile_id", "table_key", "field_key",
+               "item_index", "original_value", "corrected_value",
+               "correction_type", "page_source", "raw_text_context",
+               "user_id", "username", "created_at"]
+    return [dict(zip(columns, row)) for row in rows]
+
+
+def get_correction_stats(profile_id: int = 1) -> list:
+    """Get correction counts grouped by table_key + field_key."""
+    conn = _connect()
+    rows = conn.execute("""
+        SELECT table_key, field_key, COUNT(*) as count,
+               MIN(created_at) as first_at, MAX(created_at) as last_at
+        FROM corrections
+        WHERE profile_id = ?
+        GROUP BY table_key, field_key
+        ORDER BY count DESC
+    """, (profile_id,)).fetchall()
+    conn.close()
+    return [{"table_key": r[0], "field_key": r[1], "count": r[2],
+             "first_at": r[3], "last_at": r[4]} for r in rows]
+
+
+def get_correction_count_for_field(profile_id: int, table_key: str, field_key: str) -> int:
+    """Get number of corrections for a specific field."""
+    conn = _connect()
+    row = conn.execute("""
+        SELECT COUNT(*) FROM corrections
+        WHERE profile_id = ? AND table_key = ? AND field_key = ?
+    """, (profile_id, table_key, field_key)).fetchone()
+    conn.close()
+    return row[0] if row else 0
+
+
+def save_learning_event(profile_id: int, event_type: str, event_data: str,
+                        trigger_correction_id: int = None,
+                        corrections_analyzed: int = 0) -> int:
+    """Record a learning event."""
+    conn = _connect()
+    cursor = conn.cursor()
+    cursor.execute("""
+        INSERT INTO learning_events (profile_id, event_type, event_data,
+            trigger_correction_id, corrections_analyzed)
+        VALUES (?, ?, ?, ?, ?)
+    """, (profile_id, event_type, event_data, trigger_correction_id, corrections_analyzed))
+    event_id = cursor.lastrowid
+    conn.commit()
+    conn.close()
+    return event_id
+
+
+def get_learning_events(profile_id: int = 1, limit: int = 50) -> list:
+    """Get learning events for a profile."""
+    conn = _connect()
+    rows = conn.execute("""
+        SELECT id, profile_id, event_type, event_data,
+               trigger_correction_id, corrections_analyzed, created_at
+        FROM learning_events
+        WHERE profile_id = ?
+        ORDER BY created_at DESC LIMIT ?
+    """, (profile_id, limit)).fetchall()
+    conn.close()
+    return [{"id": r[0], "profile_id": r[1], "event_type": r[2],
+             "event_data": r[3], "trigger_correction_id": r[4],
+             "corrections_analyzed": r[5], "created_at": r[6]} for r in rows]
+
+
+# =============================================================================
+# GROUPS — RBAC
+# =============================================================================
+
+ALL_PERMISSIONS = {
+    "pages": {"agent": True, "history": True, "items": True, "declarations": True, "costs": True, "settings": True},
+    "actions": {"run_pipeline": True, "upload_pdf": True, "download_excel": True, "delete_jobs": True, "export_data": True},
+    "data_scope": "all_full",
+}
+
+DEFAULT_PERMISSIONS = {
+    "pages": {"agent": True, "history": True, "items": True, "declarations": True, "costs": True, "settings": False},
+    "actions": {"run_pipeline": True, "upload_pdf": True, "download_excel": True, "delete_jobs": False, "export_data": True},
+    "data_scope": "own",
+}
+
+
+def create_group(name: str, description: str = "", **kwargs) -> Optional[int]:
+    """Create a new group. Returns group id or None if name exists."""
+    conn = _connect()
+    cursor = conn.cursor()
+    try:
+        cols = ["name", "description"]
+        vals = [name, description]
+        for k in ["page_agent", "page_history", "page_items", "page_declarations",
+                   "page_costs", "page_settings", "action_run_pipeline", "action_upload_pdf",
+                   "action_download_excel", "action_delete_jobs", "action_export_data"]:
+            if k in kwargs:
+                cols.append(k)
+                vals.append(1 if kwargs[k] else 0)
+        if "data_scope" in kwargs:
+            cols.append("data_scope")
+            vals.append(kwargs["data_scope"])
+        placeholders = ",".join(["?"] * len(vals))
+        col_str = ",".join(cols)
+        cursor.execute(f"INSERT INTO groups ({col_str}) VALUES ({placeholders})", vals)
+        gid = cursor.lastrowid
+        conn.commit()
+        conn.close()
+        return gid
+    except sqlite3.IntegrityError:
+        conn.close()
+        return None
+
+
+def update_group(group_id: int, **kwargs):
+    """Update group fields."""
+    conn = _connect()
+    cursor = conn.cursor()
+    sets = []
+    vals = []
+    for k, v in kwargs.items():
+        if k in ["name", "description", "data_scope"]:
+            sets.append(f"{k} = ?")
+            vals.append(v)
+        elif k.startswith("page_") or k.startswith("action_"):
+            sets.append(f"{k} = ?")
+            vals.append(1 if v else 0)
+    if sets:
+        vals.append(group_id)
+        cursor.execute(f"UPDATE groups SET {', '.join(sets)} WHERE id = ?", vals)
+    conn.commit()
+    conn.close()
+
+
+def delete_group(group_id: int) -> bool:
+    """Delete a group and its member assignments."""
+    conn = _connect()
+    cursor = conn.cursor()
+    cursor.execute("DELETE FROM user_groups WHERE group_id = ?", (group_id,))
+    cursor.execute("DELETE FROM groups WHERE id = ?", (group_id,))
+    deleted = cursor.rowcount > 0
+    conn.commit()
+    conn.close()
+    return deleted
+
+
+def get_all_groups() -> List[Dict]:
+    """Get all groups with member count."""
+    conn = _connect()
+    conn.row_factory = sqlite3.Row
+    cursor = conn.cursor()
+    cursor.execute("""
+        SELECT g.*, COUNT(ug.user_id) as member_count
+        FROM groups g
+        LEFT JOIN user_groups ug ON g.id = ug.group_id
+        GROUP BY g.id
+        ORDER BY g.name
+    """)
+    groups = [dict(row) for row in cursor.fetchall()]
+    conn.close()
+    return groups
+
+
+def get_group(group_id: int) -> Optional[Dict]:
+    """Get a single group by ID."""
+    conn = _connect()
+    conn.row_factory = sqlite3.Row
+    cursor = conn.cursor()
+    cursor.execute("SELECT * FROM groups WHERE id = ?", (group_id,))
+    row = cursor.fetchone()
+    conn.close()
+    return dict(row) if row else None
+
+
+def get_group_members(group_id: int) -> List[Dict]:
+    """Get all users in a group."""
+    conn = _connect()
+    conn.row_factory = sqlite3.Row
+    cursor = conn.cursor()
+    cursor.execute("""
+        SELECT u.id, u.username, u.display_name, u.email, u.role, u.keycloak_id
+        FROM users u
+        JOIN user_groups ug ON u.id = ug.user_id
+        WHERE ug.group_id = ?
+        ORDER BY u.username
+    """, (group_id,))
+    members = [dict(row) for row in cursor.fetchall()]
+    conn.close()
+    return members
+
+
+def set_user_group(user_id: int, group_id: Optional[int], assigned_by: str = "admin"):
+    """Assign a user to a group. Pass group_id=None to remove from all groups."""
+    conn = _connect()
+    cursor = conn.cursor()
+    cursor.execute("DELETE FROM user_groups WHERE user_id = ?", (user_id,))
+    if group_id is not None:
+        cursor.execute(
+            "INSERT INTO user_groups (user_id, group_id, assigned_by) VALUES (?, ?, ?)",
+            (user_id, group_id, assigned_by),
+        )
+    conn.commit()
+    conn.close()
+
+
+def set_group_members(group_id: int, user_ids: List[int], assigned_by: str = "admin"):
+    """Set the full member list for a group (replace existing)."""
+    conn = _connect()
+    cursor = conn.cursor()
+    cursor.execute("DELETE FROM user_groups WHERE group_id = ?", (group_id,))
+    for uid in user_ids:
+        cursor.execute(
+            "INSERT OR IGNORE INTO user_groups (user_id, group_id, assigned_by) VALUES (?, ?, ?)",
+            (uid, group_id, assigned_by),
+        )
+    conn.commit()
+    conn.close()
+
+
+def get_user_group(user_id: int) -> Optional[Dict]:
+    """Get the group a user belongs to (first group if multiple)."""
+    conn = _connect()
+    conn.row_factory = sqlite3.Row
+    cursor = conn.cursor()
+    cursor.execute("""
+        SELECT g.* FROM groups g
+        JOIN user_groups ug ON g.id = ug.group_id
+        WHERE ug.user_id = ?
+        LIMIT 1
+    """, (user_id,))
+    row = cursor.fetchone()
+    conn.close()
+    return dict(row) if row else None
+
+
+def get_user_permissions(user: Dict) -> Dict:
+    """Get full permission dict for a user. Admin gets all permissions."""
+    if user.get("role") == "admin":
+        return ALL_PERMISSIONS
+
+    group = get_user_group(user["id"])
+    if group:
+        return {
+            "pages": {
+                "agent": bool(group["page_agent"]),
+                "history": bool(group["page_history"]),
+                "items": bool(group["page_items"]),
+                "declarations": bool(group["page_declarations"]),
+                "costs": bool(group["page_costs"]),
+                "settings": bool(group["page_settings"]),
+            },
+            "actions": {
+                "run_pipeline": bool(group["action_run_pipeline"]),
+                "upload_pdf": bool(group["action_upload_pdf"]),
+                "download_excel": bool(group["action_download_excel"]),
+                "delete_jobs": bool(group["action_delete_jobs"]),
+                "export_data": bool(group["action_export_data"]),
+            },
+            "data_scope": group.get("data_scope", "own"),
+        }
+
+    return DEFAULT_PERMISSIONS
+
+
+def get_all_users_with_groups() -> List[Dict]:
+    """Get all users with their group info."""
+    conn = _connect()
+    conn.row_factory = sqlite3.Row
+    cursor = conn.cursor()
+    cursor.execute("""
+        SELECT u.id, u.username, u.display_name, u.email, u.role, u.is_active,
+               u.keycloak_id, u.created_at, u.last_login,
+               g.id as group_id, g.name as group_name
+        FROM users u
+        LEFT JOIN user_groups ug ON u.id = ug.user_id
+        LEFT JOIN groups g ON ug.group_id = g.id
+        ORDER BY u.created_at
+    """)
+    users = [dict(row) for row in cursor.fetchall()]
+    conn.close()
+    return users
+
+
+# =============================================================================
+# KEYCLOAK USER UPSERT
+# =============================================================================
+
+def upsert_keycloak_user(keycloak_id: str, username: str, display_name: str,
+                         email: str, role: str) -> Dict:
+    """
+    Insert or update a Keycloak user. Adopts existing local user if username matches.
+    Returns user dict with integer PK (preserves FK relationships).
+    """
+    conn = _connect()
+    conn.row_factory = sqlite3.Row
+    cursor = conn.cursor()
+
+    # 1. Try to find by keycloak_id (existing Keycloak user)
+    cursor.execute("SELECT * FROM users WHERE keycloak_id = ?", (keycloak_id,))
+    user = cursor.fetchone()
+    if user:
+        cursor.execute("""
+            UPDATE users SET username = ?, display_name = ?, email = ?, role = ?,
+                             last_login = CURRENT_TIMESTAMP
+            WHERE keycloak_id = ?
+        """, (username, display_name, email, role, keycloak_id))
+        conn.commit()
+        user_dict = dict(user)
+        user_dict.update({"username": username, "display_name": display_name, "email": email, "role": role})
+        conn.close()
+        return user_dict
+
+    # 2. Try to adopt existing local user by username match
+    cursor.execute("SELECT * FROM users WHERE username = ? AND keycloak_id IS NULL", (username,))
+    user = cursor.fetchone()
+    if user:
+        cursor.execute("""
+            UPDATE users SET keycloak_id = ?, display_name = ?, email = ?, role = ?,
+                             last_login = CURRENT_TIMESTAMP
+            WHERE id = ?
+        """, (keycloak_id, display_name, email, role, user["id"]))
+        conn.commit()
+        user_dict = dict(user)
+        user_dict.update({"keycloak_id": keycloak_id, "display_name": display_name, "email": email, "role": role})
+        conn.close()
+        return user_dict
+
+    # 3. Create new user
+    cursor.execute("""
+        INSERT INTO users (username, password_hash, display_name, role, keycloak_id, email, last_login)
+        VALUES (?, '', ?, ?, ?, ?, CURRENT_TIMESTAMP)
+    """, (username, display_name, role, keycloak_id, email))
+    new_id = cursor.lastrowid
+    conn.commit()
+
+    cursor.execute("SELECT * FROM users WHERE id = ?", (new_id,))
+    user = cursor.fetchone()
+    user_dict = dict(user) if user else {"id": new_id, "username": username, "role": role, "display_name": display_name}
+    conn.close()
+    return user_dict
+
+
+# =============================================================================
+# PAGE EXTRACTIONS — v2 per-page structured data
+# =============================================================================
+
+def save_page_extractions(job_id: str, page_results: List[Dict]):
+    """Save v2 per-page extraction results."""
+    conn = _connect()
+    cursor = conn.cursor()
+
+    for pr in page_results:
+        parsed = pr.get("parsed", {})
+        doc = parsed.get("document", {})
+        visual = parsed.get("visual", {})
+        entities = parsed.get("entities", {})
+
+        cursor.execute("""
+            INSERT INTO page_extractions
+                (job_id, page_number, page_type, language, confidence, explanation,
+                 doc_title, doc_issuer, doc_date, doc_reference, doc_country,
+                 fields_json, items_json, amounts_json, entities_json,
+                 has_logo, has_stamp, has_signature, has_barcode, visual_quality,
+                 raw_char_count, orientation, pipeline_version)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'v2')
+        """, (
+            job_id,
+            pr.get("page_number", 0),
+            pr.get("page_type", "unknown"),
+            parsed.get("language", ""),
+            pr.get("confidence", 0),
+            pr.get("explanation", ""),
+            doc.get("title", ""),
+            doc.get("issuer", ""),
+            doc.get("date", ""),
+            doc.get("reference", ""),
+            doc.get("country", ""),
+            json.dumps(parsed.get("fields", {}), ensure_ascii=False, default=str),
+            json.dumps(parsed.get("items", []), ensure_ascii=False, default=str),
+            json.dumps(parsed.get("amounts", []), ensure_ascii=False, default=str),
+            json.dumps(entities, ensure_ascii=False, default=str),
+            1 if visual.get("has_logo") else 0,
+            1 if visual.get("has_stamp") else 0,
+            1 if visual.get("has_signature") else 0,
+            1 if visual.get("has_barcode") else 0,
+            visual.get("quality", ""),
+            pr.get("raw_char_count", 0),
+            pr.get("orientation", "portrait"),
+        ))
+
+    conn.commit()
+    conn.close()
+    print(f"  Saved {len(page_results)} page extractions for {job_id}")
+
+
+def get_page_extractions(job_id: str) -> List[Dict]:
+    """Get all page extractions for a job."""
+    conn = _connect()
+    conn.row_factory = sqlite3.Row
+    cursor = conn.cursor()
+    cursor.execute("""
+        SELECT * FROM page_extractions WHERE job_id = ? ORDER BY page_number
+    """, (job_id,))
+    rows = [dict(row) for row in cursor.fetchall()]
+    conn.close()
+    for row in rows:
+        for jf in ('fields_json', 'items_json', 'amounts_json', 'entities_json'):
+            if row.get(jf):
+                try:
+                    row[jf.replace('_json', '')] = json.loads(row.pop(jf))
+                except (json.JSONDecodeError, TypeError, ValueError):
+                    row[jf.replace('_json', '')] = {}
+                    del row[jf]
+            else:
+                row[jf.replace('_json', '')] = {} if 'fields' in jf or 'entities' in jf else []
+                if jf in row:
+                    del row[jf]
+    return rows
+
+
+def _normalize_importer(name: str) -> str:
+    """Normalize importer name for matching (strip suffixes, uppercase)."""
+    import re
+    n = str(name).upper().strip()
+    n = re.sub(r'\s*(CO\.,?\s*LTD\.?|COMPANY\s+LIMITED|PTE\s+LTD\.?|LTD\.?)\s*$', '', n).strip()
+    n = re.sub(r'\s+', ' ', n)
+    return n
+
+
+def get_importer_profile(importer_name: str) -> Optional[Dict]:
+    """Get learned profile for an importer."""
+    norm = _normalize_importer(importer_name)
+    if not norm:
+        return None
+    conn = _connect()
+    conn.row_factory = sqlite3.Row
+    row = conn.execute(
+        "SELECT * FROM importer_profiles WHERE importer_name_normalized = ?", (norm,)
+    ).fetchone()
+    conn.close()
+    return dict(row) if row else None
+
+
+def update_importer_profile(importer_name: str, currency: str = None,
+                            exchange_rate: float = None, consignor: str = None,
+                            items_summary: str = None):
+    """Update or create importer profile from completed job data."""
+    norm = _normalize_importer(importer_name)
+    if not norm:
+        return
+    conn = _connect()
+    existing = conn.execute(
+        "SELECT * FROM importer_profiles WHERE importer_name_normalized = ?", (norm,)
+    ).fetchone()
+
+    if existing:
+        # Update running stats
+        total_jobs = (existing[10] or 0) + 1  # total_jobs column
+        old_min = existing[5] or exchange_rate or 0
+        old_max = existing[6] or exchange_rate or 0
+        old_avg = existing[7] or exchange_rate or 0
+        new_min = min(old_min, exchange_rate) if exchange_rate else old_min
+        new_max = max(old_max, exchange_rate) if exchange_rate else old_max
+        new_avg = ((old_avg * (total_jobs - 1)) + (exchange_rate or old_avg)) / total_jobs
+
+        conn.execute("""
+            UPDATE importer_profiles SET
+                currency = COALESCE(?, currency),
+                exchange_rate_min = ?, exchange_rate_max = ?, exchange_rate_avg = ?,
+                common_consignor = COALESCE(?, common_consignor),
+                common_items = COALESCE(?, common_items),
+                total_jobs = ?,
+                last_job_date = datetime('now'),
+                updated_at = datetime('now')
+            WHERE importer_name_normalized = ?
+        """, (currency, new_min, new_max, round(new_avg, 4),
+              consignor, items_summary, total_jobs, norm))
+    else:
+        conn.execute("""
+            INSERT INTO importer_profiles
+                (importer_name, importer_name_normalized, currency,
+                 exchange_rate_min, exchange_rate_max, exchange_rate_avg,
+                 common_consignor, common_items, total_jobs, last_job_date)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, datetime('now'))
+        """, (importer_name, norm, currency,
+              exchange_rate, exchange_rate, exchange_rate,
+              consignor, items_summary))
+
+    conn.commit()
+    conn.close()
+
+
+def update_field_accuracy(importer_name: str, field_key: str, was_corrected: bool = False):
+    """Track field accuracy per importer."""
+    norm = _normalize_importer(importer_name)
+    if not norm:
+        return
+    conn = _connect()
+    conn.execute("""
+        INSERT INTO field_accuracy (importer_name_normalized, field_key, total_extractions, corrections_count)
+        VALUES (?, ?, 1, ?)
+        ON CONFLICT(importer_name_normalized, field_key)
+        DO UPDATE SET
+            total_extractions = total_extractions + 1,
+            corrections_count = corrections_count + ?,
+            last_correction_at = CASE WHEN ? THEN datetime('now') ELSE last_correction_at END
+    """, (norm, field_key, 1 if was_corrected else 0,
+          1 if was_corrected else 0, was_corrected))
+    conn.commit()
+    conn.close()
+
+
+def get_weak_fields(importer_name: str, min_error_rate: float = 0.3) -> List[str]:
+    """Get fields that have high error rate for an importer."""
+    norm = _normalize_importer(importer_name)
+    if not norm:
+        return []
+    conn = _connect()
+    rows = conn.execute("""
+        SELECT field_key, total_extractions, corrections_count
+        FROM field_accuracy
+        WHERE importer_name_normalized = ? AND total_extractions >= 2
+    """, (norm,)).fetchall()
+    conn.close()
+    weak = []
+    for field, total, corrections in rows:
+        if total > 0 and corrections / total >= min_error_rate:
+            weak.append(field)
+    return weak
+
+
+def save_value_audit(job_id: str, table_key: str, field_key: str,
+                     stage: str, old_value: str, new_value: str,
+                     source: str = "", item_index: int = None):
+    """Record a value change in the audit trail."""
+    conn = _connect()
+    conn.execute("""
+        INSERT INTO value_audit (job_id, table_key, field_key, item_index, stage, old_value, new_value, source)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    """, (job_id, table_key, field_key, item_index, stage, str(old_value), str(new_value), source))
+    conn.commit()
+    conn.close()
+
+
+if __name__ == "__main__":
+    # Initialize database
+    init_database()
+
+    # Show stats
+    stats = get_stats()
+    print("\n📊 Database Statistics:")
+    print(f"Total Jobs: {stats['total_jobs']}")
+    print(f"Completed: {stats['completed_jobs']}")
+    print(f"Failed: {stats['failed_jobs']}")
+    print(f"Total Items (Format 1): {stats['total_items']}")
+    print(f"Total Declarations (Format 2): {stats['total_declarations']}")
+    print(f"Avg Accuracy: {stats['avg_accuracy']:.1f}%")
+    print(f"Total Cost: ${stats['total_cost']:.4f}")
