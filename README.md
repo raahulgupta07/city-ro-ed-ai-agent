@@ -12,7 +12,7 @@ Built by **City AI Team** — City Holdings Myanmar
 PDF → HD Images → Vision AI per page → QA → Master Agents → QA → Verifier → Results
 ```
 
-9 steps. No Tesseract. No hardcoding. Zero calculations. Every value read directly from the document.
+12 steps. No Tesseract. No hardcoding. Zero calculations. Every value read directly from the document.
 
 ---
 
@@ -98,11 +98,13 @@ Step 2:  VISION AGENTS      — Per-page extraction (parallel, 8 workers, semaph
 Step 3:  VISION QA          — Re-run bad pages only
 Step 4:  DECLARATION AGENT  — 16 column agents (json_schema enforced)
 Step 5:  DECLARATION QA     — Re-run missing fields only
-Step 6:  ITEMS AGENT        — 9 column agents (json_schema enforced)
+Step 6:  ITEMS AGENT        — 10 column agents (json_schema enforced)
 Step 7:  ITEMS QA           — Re-run missing fields only
-Step 8:  CROSS-VALIDATION   — Items sum = declaration total
-Step 9:  VERIFIER           — Claude Sonnet checks against page images
-Step 10: FEE SHIFT FIX      — Deterministic correction for LLM fee field shifting
+Step 8:  ITEM DEDUP         — Remove duplicate items (same name + HS code)
+Step 9:  PRICE FALLBACK     — Copy Invoice↔CIF price if one is missing
+Step 10: CROSS-VALIDATION   — Items sum = declaration total
+Step 11: VERIFIER           — Claude Sonnet checks against page images
+Step 12: FEE SHIFT FIX      — Deterministic correction for LLM fee field shifting
 ```
 
 ### Models
@@ -118,7 +120,7 @@ Step 10: FEE SHIFT FIX      — Deterministic correction for LLM fee field shift
 
 ## Output Tables
 
-### Table 1: Product Items (12 columns in Excel)
+### Table 1: Product Items (13 columns)
 
 | Column | Description |
 |--------|-------------|
@@ -126,7 +128,8 @@ Step 10: FEE SHIFT FIX      — Deterministic correction for LLM fee field shift
 | Item Name | Full product description |
 | Customs Duty Rate | Duty as decimal (0.15 = 15%) |
 | Quantity (1) | Quantity with unit (e.g. "17,280 KG") |
-| Invoice Unit Price | Price per unit in foreign currency |
+| Invoice Unit Price | FOB price from commercial invoice (supplier price, lower) |
+| CIF Unit Price | CIF price from customs declaration (includes freight+insurance, higher) |
 | Currency | Invoice currency (from declaration) |
 | Commercial Tax % | Tax as decimal (0.05 = 5%) |
 | Exchange Rate (1) | Foreign to local currency rate |
@@ -202,8 +205,8 @@ cd backend && python -m pipeline.pipeline /path/to/document.pdf
 | Accuracy | 100% (12 PDFs, zero corrections) |
 | Cost | $0.14-0.18 per PDF |
 | Speed | 60-130s per PDF |
-| Max pages tested | 29 pages |
-| Max items | 8 per document |
+| Max pages tested | 29 pages (cap: 50) |
+| Max items | 21 per document |
 | Concurrent users | 10 |
 
 ---

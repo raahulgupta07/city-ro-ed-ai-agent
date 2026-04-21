@@ -57,8 +57,9 @@ RO-ED-Lang/
     │   ├── vision.py        # Per-page agents (parallel, semaphore=16) + QA gate
     │   ├── assembler.py     # Master + Column Agents:
     │   │                      Declaration Master (16 column agents, json_schema)
-    │   │                      Items Master (9 column agents, json_schema)
-    │   │                      QA after each + cross-validation
+    │   │                      Items Master (10 column agents, json_schema)
+    │   │                      QA after each + cross-validation + item dedup
+    │   │                      Fee shift detection + deterministic correction
     │   │                      Token-optimized (dedup fields, no metadata)
     │   ├── verifier.py      # Claude Sonnet cross-checks against page images
     │   └── pipeline.py      # Orchestrator (memory cleanup after verifier)
@@ -79,12 +80,15 @@ PDF Upload
   → Step 3:  VISION QA         — Re-run bad pages only
   → Step 4:  DECLARATION AGENT — 16 column agents (json_schema enforced)
   → Step 5:  DECLARATION QA    — Re-run missing fields only
-  → Step 6:  ITEMS AGENT       — 9 column agents (json_schema enforced)
+  → Step 6:  ITEMS AGENT       — 10 column agents (json_schema enforced)
   → Step 7:  ITEMS QA          — Re-run missing fields only
-  → Step 8:  CROSS-VALIDATION  — Items sum = declaration total
-  → Step 9:  VERIFIER          — Claude Sonnet checks against page images
-  → Step 10: FEE SHIFT FIX     — Deterministic post-verifier correction (see below)
+  → Step 8:  ITEM DEDUP        — Remove duplicate items (same name + HS code)
+  → Step 9:  PRICE FALLBACK    — Copy Invoice↔CIF price if one is missing
+  → Step 10: CROSS-VALIDATION  — Items sum = declaration total
+  → Step 11: VERIFIER          — Claude Sonnet checks against page images
+  → Step 12: FEE SHIFT FIX     — Deterministic post-verifier correction (see below)
   → Save to DB + Excel
+  → Max 50 pages per PDF (memory guard)
 ```
 
 ## Models
@@ -127,22 +131,27 @@ This happens at every pipeline layer (vision, assembler, verifier) because the d
 
 ## Output Tables — Column Definitions
 
-### Items Table (11 columns in UI, 12 in Excel)
+### Items Table (13 columns — synced across UI, Excel per-job, Excel all-items)
 
 | Column | DB Key | Source |
 |--------|--------|--------|
 | Job | job_id | Auto-generated |
 | Item Name | item_name | Assembler |
-| Customs Duty Rate | customs_duty_rate | Assembler |
-| Quantity (1) | quantity | Assembler |
-| Invoice Unit Price | invoice_unit_price | Assembler |
+| Customs Duty Rate | customs_duty_rate | Assembler (decimal, e.g. 0.15 = 15%) |
+| Quantity (1) | quantity | Assembler (with unit, e.g. "17,280 KG") |
+| Invoice Unit Price | invoice_unit_price | Commercial invoice (FOB/supplier price, lower) |
+| CIF Unit Price | cif_unit_price | Customs declaration (CIF price, higher) |
 | Currency | currency | From declaration |
-| Commercial Tax % | commercial_tax_percent | Assembler |
-| Exchange Rate (1) | exchange_rate | Assembler |
+| Commercial Tax % | commercial_tax_percent | Assembler (decimal, e.g. 0.05 = 5%) |
+| Exchange Rate (1) | exchange_rate | From declaration |
 | HS Code | hs_code | Assembler |
 | Origin Country | origin_country | Assembler |
 | Customs Value (MMK) | customs_value_mmk | Assembler |
 | Processed | created_at | Auto-generated |
+
+**Invoice Unit Price vs CIF Unit Price:** Two different prices from two different pages.
+Invoice = supplier FOB price (from commercial invoice). CIF = customs-assessed price (from customs declaration, includes freight+insurance).
+If one is missing, the other is copied as fallback so both columns always have a value.
 
 ### Declaration Table (18 columns)
 
