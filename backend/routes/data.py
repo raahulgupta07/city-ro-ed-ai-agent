@@ -216,6 +216,7 @@ async def download_items_excel(current_user: dict = Depends(get_current_user)):
                 "Customs Duty Rate": item.get("customs_duty_rate", ""),
                 "Quantity (1)": item.get("quantity", ""),
                 "Invoice Unit Price": item.get("invoice_unit_price", ""),
+                "CIF Unit Price": item.get("cif_unit_price", ""),
                 "Currency": decl_currency,
                 "Commercial Tax %": item.get("commercial_tax_percent", ""),
                 "Exchange Rate (1)": item.get("exchange_rate", ""),
@@ -226,7 +227,7 @@ async def download_items_excel(current_user: dict = Depends(get_current_user)):
             })
 
     all_cols = ["Job", "Item Name", "Customs Duty Rate", "Quantity (1)", "Invoice Unit Price",
-                "Currency", "Commercial Tax %", "Exchange Rate (1)", "HS Code",
+                "CIF Unit Price", "Currency", "Commercial Tax %", "Exchange Rate (1)", "HS Code",
                 "Origin Country", "Customs Value (MMK)", "Processed"]
     df = pd.DataFrame(all_items) if all_items else pd.DataFrame(columns=all_cols)
 

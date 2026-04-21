@@ -77,6 +77,7 @@ def init_database():
             customs_duty_rate REAL,
             quantity TEXT,
             invoice_unit_price TEXT,
+            cif_unit_price TEXT,
             commercial_tax_percent REAL,
             exchange_rate TEXT,
             hs_code TEXT,
@@ -430,6 +431,10 @@ def init_database():
         cursor.execute("ALTER TABLE items ADD COLUMN customs_value_mmk REAL")
     except Exception:
         pass
+    try:
+        cursor.execute("ALTER TABLE items ADD COLUMN cif_unit_price TEXT")
+    except Exception:
+        pass
 
     # Corrections table — stores user corrections for self-learning
     cursor.execute("""
@@ -556,15 +561,16 @@ def save_items(job_id: str, items: List[Dict]):
     for item in items:
         cursor.execute("""
             INSERT INTO items (job_id, item_name, customs_duty_rate, quantity,
-                             invoice_unit_price, commercial_tax_percent, exchange_rate,
-                             hs_code, origin_country, customs_value_mmk)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                             invoice_unit_price, cif_unit_price, commercial_tax_percent,
+                             exchange_rate, hs_code, origin_country, customs_value_mmk)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (
             job_id,
             item.get('Item name', ''),
             item.get('Customs duty rate', 0.0),
             item.get('Quantity (1)', ''),
             item.get('Invoice unit price', ''),
+            item.get('CIF unit price', ''),
             item.get('Commercial tax %', 0.0),
             item.get('Exchange Rate (1)', ''),
             item.get('HS Code', ''),

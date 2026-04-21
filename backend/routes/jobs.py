@@ -488,6 +488,7 @@ async def download_job_excel(job_id: str, current_user: dict = Depends(get_curre
             'Customs Duty Rate': item.get('customs_duty_rate', ''),
             'Quantity (1)': item.get('quantity', ''),
             'Invoice Unit Price': item.get('invoice_unit_price', ''),
+            'CIF Unit Price': item.get('cif_unit_price', ''),
             'Currency': item.get('currency', job.get('declarations', [{}])[0].get('currency', '') if job.get('declarations') else ''),
             'Commercial Tax %': item.get('commercial_tax_percent', ''),
             'Exchange Rate (1)': item.get('exchange_rate', ''),
@@ -496,8 +497,8 @@ async def download_job_excel(job_id: str, current_user: dict = Depends(get_curre
             'Customs Value (MMK)': item.get('customs_value_mmk', ''),
         } for item in items]
         all_item_cols = ['Item Name', 'Customs Duty Rate', 'Quantity (1)', 'Invoice Unit Price',
-                         'Currency', 'Commercial Tax %', 'Exchange Rate (1)', 'HS Code',
-                         'Origin Country', 'Customs Value (MMK)']
+                         'CIF Unit Price', 'Currency', 'Commercial Tax %', 'Exchange Rate (1)',
+                         'HS Code', 'Origin Country', 'Customs Value (MMK)']
         df_items = pd.DataFrame(items_data, columns=all_item_cols) if items_data else pd.DataFrame(columns=all_item_cols)
         _style_sheet(writer, df_items, 'Product Items')
 

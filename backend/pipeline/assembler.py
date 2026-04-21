@@ -293,11 +293,17 @@ AGENT 2 — Quantity (1):
   Look in invoices, packing lists, item tables.
 
 AGENT 3 — Invoice unit price:
-  Search for: "Invoice unit price" field on the CUSTOMS DECLARATION pages.
-  Look for the field labeled exactly "Invoice unit price" — it shows the price per unit.
-  Do NOT use "Unit Cost" from invoice tables — that may be a different value (CIF/FOB cost).
-  The customs declaration's "Invoice unit price" field is the most reliable source.
-  If there are multiple prices, use the HIGHER one (the actual invoice price is always higher than CIF cost).
+  Search for: unit price, unit cost, price per unit on the COMMERCIAL INVOICE page.
+  Look for the invoice/price list table — the column showing price per KG or per unit.
+  This is the SUPPLIER price (FOB/FCA) — usually the LOWER price.
+  Do NOT use the customs declaration "Invoice unit price" — that's the CIF price (higher).
+  Return in FOREIGN currency (not local/MMK).
+  Read the EXACT value from the document. Do NOT calculate.
+
+AGENT 10 — CIF unit price:
+  Search for: "Invoice unit price" field on the CUSTOMS DECLARATION / RELEASE ORDER pages.
+  Look for the field labeled "Invoice unit price" on the customs declaration item rows.
+  This is the CIF price (includes freight + insurance) — usually HIGHER than the invoice price.
   Return in FOREIGN currency (not local/MMK).
   Read the EXACT value from the document. Do NOT calculate.
 
@@ -341,6 +347,7 @@ AGENT 9 — Exchange Rate (1):
       "Item name": "<value>",
       "Quantity (1)": "<qty with unit>",
       "Invoice unit price": <numeric>,
+      "CIF unit price": <numeric>,
       "Customs Value (MMK)": <numeric>,
       "Customs duty rate": <decimal>,
       "Commercial tax %": <decimal>,
@@ -352,8 +359,11 @@ AGENT 9 — Exchange Rate (1):
 }}
 
 CRITICAL RULES:
-- You MUST fill ALL 9 fields for EVERY item. No nulls allowed.
+- You MUST fill ALL 10 fields for EVERY item. No nulls allowed.
 - Read EVERY value directly from the document. Do NOT calculate or guess.
+- Invoice unit price = from COMMERCIAL INVOICE (supplier FOB price, LOWER).
+- CIF unit price = from CUSTOMS DECLARATION (CIF price, HIGHER).
+- These are TWO DIFFERENT prices from TWO DIFFERENT pages. Both must be filled.
 - Exchange Rate is ALWAYS {exchange_rate} — just copy it.
 - Duty rate and tax %: READ from the customs declaration per-item rows. Do NOT divide totals.
 - Return ONLY valid JSON.
@@ -412,9 +422,9 @@ DECL_REQUIRED = [
 ]
 
 ITEM_REQUIRED = [
-    "Item name", "Quantity (1)", "Invoice unit price", "Customs Value (MMK)",
-    "Customs duty rate", "Commercial tax %", "HS Code", "Origin Country",
-    "Exchange Rate (1)",
+    "Item name", "Quantity (1)", "Invoice unit price", "CIF unit price",
+    "Customs Value (MMK)", "Customs duty rate", "Commercial tax %",
+    "HS Code", "Origin Country", "Exchange Rate (1)",
 ]
 
 
@@ -664,6 +674,7 @@ ITEMS_SCHEMA = {
                         "Item name": {"type": ["string", "null"]},
                         "Quantity (1)": {"type": ["string", "null"]},
                         "Invoice unit price": {"type": ["number", "null"]},
+                        "CIF unit price": {"type": ["number", "null"]},
                         "Customs Value (MMK)": {"type": ["number", "null"]},
                         "Customs duty rate": {"type": ["number", "null"]},
                         "Commercial tax %": {"type": ["number", "null"]},
@@ -671,9 +682,9 @@ ITEMS_SCHEMA = {
                         "Origin Country": {"type": ["string", "null"]},
                         "Exchange Rate (1)": {"type": ["number", "null"]},
                     },
-                    "required": ["Item name", "Quantity (1)", "Invoice unit price", "Customs Value (MMK)",
-                                  "Customs duty rate", "Commercial tax %", "HS Code", "Origin Country",
-                                  "Exchange Rate (1)"],
+                    "required": ["Item name", "Quantity (1)", "Invoice unit price", "CIF unit price",
+                                  "Customs Value (MMK)", "Customs duty rate", "Commercial tax %",
+                                  "HS Code", "Origin Country", "Exchange Rate (1)"],
                 }
             }
         },

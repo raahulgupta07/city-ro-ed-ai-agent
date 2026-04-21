@@ -106,6 +106,7 @@ class ItemResponse(BaseModel):
     customs_duty_rate: Optional[float] = None
     quantity: Optional[str] = None
     invoice_unit_price: Optional[str] = None
+    cif_unit_price: Optional[str] = None
     commercial_tax_percent: Optional[float] = None
     exchange_rate: Optional[str] = None
     hs_code: Optional[str] = None
