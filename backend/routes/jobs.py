@@ -501,11 +501,12 @@ async def download_job_excel(job_id: str, current_user: dict = Depends(get_curre
         df_items = pd.DataFrame(items_data, columns=all_item_cols) if items_data else pd.DataFrame(columns=all_item_cols)
         _style_sheet(writer, df_items, 'Product Items')
 
-        # Sheet 2: Declaration (all 16 fields)
+        # Sheet 2: Declaration (all 18 columns)
         declarations = job.get('declarations', [])
         decl_data = []
         for decl in declarations:
             decl_data.append({
+                'Job': job_id,
                 'Declaration No': decl.get('declaration_no', ''),
                 'Declaration Date': decl.get('declaration_date', ''),
                 'Importer (Name)': decl.get('importer_name', ''),
@@ -514,6 +515,7 @@ async def download_job_excel(job_id: str, current_user: dict = Depends(get_curre
                 'Invoice Price': decl.get('invoice_price', ''),
                 'Currency': decl.get('currency', ''),
                 'Exchange Rate': decl.get('exchange_rate', ''),
+                'Currency 2': decl.get('currency_2', ''),
                 'Total Customs Value': decl.get('total_customs_value', ''),
                 'Import/Export Customs Duty': decl.get('import_export_customs_duty', ''),
                 'Commercial Tax (CT)': decl.get('commercial_tax_ct', ''),
@@ -521,12 +523,13 @@ async def download_job_excel(job_id: str, current_user: dict = Depends(get_curre
                 'Security Fee (SF)': decl.get('security_fee_sf', ''),
                 'MACCS Service Fee (MF)': decl.get('maccs_service_fee_mf', ''),
                 'Exemption/Reduction': decl.get('exemption_reduction', ''),
+                'Processed': decl.get('created_at', ''),
             })
-        all_decl_cols = ['Declaration No', 'Declaration Date', 'Importer (Name)', 'Consignor (Name)',
-                         'Invoice Number', 'Invoice Price', 'Currency', 'Exchange Rate',
+        all_decl_cols = ['Job', 'Declaration No', 'Declaration Date', 'Importer (Name)', 'Consignor (Name)',
+                         'Invoice Number', 'Invoice Price', 'Currency', 'Exchange Rate', 'Currency 2',
                          'Total Customs Value', 'Import/Export Customs Duty', 'Commercial Tax (CT)',
                          'Advance Income Tax (AT)', 'Security Fee (SF)', 'MACCS Service Fee (MF)',
-                         'Exemption/Reduction']
+                         'Exemption/Reduction', 'Processed']
         df_decl = pd.DataFrame(decl_data, columns=all_decl_cols) if decl_data else pd.DataFrame(columns=all_decl_cols)
         _style_sheet(writer, df_decl, 'Declaration')
 

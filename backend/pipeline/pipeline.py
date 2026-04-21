@@ -88,6 +88,11 @@ def run_pipeline(
     filled = sum(1 for v in declaration.values() if v is not None)
     _log(f"Verified: {filled}/16 fields, {len(corrections)} corrections")
 
+    # ═══ Step 5: Fee shift correction (deterministic, post-verifier) ═══
+    from pipeline.assembler import _fix_fee_shift, _build_page_summary
+    page_summary = _build_page_summary(page_results)
+    declaration = _fix_fee_shift(declaration, page_summary, "", None)
+
     # ═══ Compute accuracy ═══
     total_fields = filled + sum(sum(1 for v in item.values() if v is not None) for item in items)
     max_fields = 16 + len(items) * 9

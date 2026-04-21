@@ -257,6 +257,14 @@ async def run_batch(ws: WebSocket):
                 corrections = verified.get("corrections", [])
                 dur4 = time.time() - t4
 
+                # Fee shift correction (deterministic, post-verifier)
+                try:
+                    from pipeline.assembler import _fix_fee_shift, _build_page_summary
+                    ps = _build_page_summary(page_results)
+                    declaration = _fix_fee_shift(declaration, ps, "", None)
+                except Exception:
+                    pass
+
                 filled = sum(1 for v in declaration.values() if v is not None)
 
                 if corrections:
@@ -299,7 +307,7 @@ async def run_batch(ws: WebSocket):
                 from v2.step5_report import save_results
                 await asyncio.to_thread(save_results, job_id, merged, validation,
                                          page_results, file_duration, file_cost,
-                                         user_id, username, "ro_ed", None)
+                                         user_id, username, "ro_ed", conf if conf else None)
 
                 await log("═══════════════════════════════════════", "success")
                 await log(f"  EXTRACTION COMPLETE", "success")

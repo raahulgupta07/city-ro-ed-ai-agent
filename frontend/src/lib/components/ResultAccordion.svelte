@@ -530,6 +530,7 @@
                   {k:'invoice_price', l:'INV PRICE', ck:'Invoice Price', def:'CIF amount in inv currency', pg:'pg1'},
                   {k:'currency', l:'CURRENCY', ck:'Currency', def:'Invoice currency (not MMK)', pg:'inv'},
                   {k:'exchange_rate', l:'FX RATE', ck:'Exchange Rate', def:'Conversion rate to MMK', pg:'pg2'},
+                  {k:'currency_2', l:'CURRENCY 2', ck:'Currency 2', def:'Same as invoice currency', pg:'pg1'},
                   {k:'total_customs_value', l:'CUSTOMS VALUE', ck:'Total Customs Value', def:'Total in MMK (largest)', pg:'pg1'},
                   {k:'import_export_customs_duty', l:'DUTY (CD)', ck:'Import/Export Customs Duty', def:'Import duty amount', pg:'pg1'},
                   {k:'commercial_tax_ct', l:'TAX (CT)', ck:'Commercial Tax (CT)', def:'Commercial tax (exempt=0)', pg:'pg1'},
@@ -537,6 +538,7 @@
                   {k:'security_fee_sf', l:'SECURITY FEE', ck:'Security Fee (SF)', def:'Security fee (optional)', pg:'pg1'},
                   {k:'maccs_service_fee_mf', l:'MACCS FEE', ck:'MACCS Service Fee (MF)', def:'MACCS service fee', pg:'pg1'},
                   {k:'exemption_reduction', l:'EXEMPTION', ck:'Exemption/Reduction', def:'Tax exemption amount', pg:'pg1'},
+                  {k:'created_at', l:'PROCESSED', ck:'Processed', def:'Processing timestamp', pg:'—'},
                 ]}
               <div class="border-2" style="border-color: var(--on-surface);">
                 <div class="dark-bar flex justify-between items-center text-xs">

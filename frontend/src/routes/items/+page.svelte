@@ -17,10 +17,13 @@
     { key: 'item_name', label: 'Item Name' },
     { key: 'customs_duty_rate', label: 'Duty Rate', align: 'right' as const },
     { key: 'quantity', label: 'Quantity' },
-    { key: 'invoice_unit_price', label: 'Unit Price' },
+    { key: 'invoice_unit_price', label: 'Unit Price', align: 'right' as const },
     { key: 'commercial_tax_percent', label: 'Tax %', align: 'right' as const },
     { key: 'exchange_rate', label: 'Exchange Rate' },
-    { key: 'created_at', label: 'Date' },
+    { key: 'hs_code', label: 'HS Code' },
+    { key: 'origin_country', label: 'Origin Country' },
+    { key: 'customs_value_mmk', label: 'Customs Value (MMK)', align: 'right' as const },
+    { key: 'created_at', label: 'Processed' },
   ];
 
   const filteredItems = $derived(() => {

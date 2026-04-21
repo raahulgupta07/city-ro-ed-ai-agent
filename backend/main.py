@@ -6,7 +6,7 @@ Myanmar PDF Data Extraction Pipeline
 
 from contextlib import asynccontextmanager
 from pathlib import Path
-from fastapi import FastAPI
+from fastapi import FastAPI, File, UploadFile, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse
@@ -57,7 +57,7 @@ app.include_router(correction_routes.router, prefix="/api/corrections", tags=["c
 
 @app.post("/api/extract")
 async def extract_pdf(
-    file: "UploadFile" = None,
+    file: UploadFile = File(...),
     mode: str = "ro_ed",
 ):
     """T4.1 — REST API Mode: Upload PDF, run extraction, return JSON results.
@@ -67,7 +67,6 @@ async def extract_pdf(
         file: PDF file upload
         mode: pipeline mode
     """
-    from fastapi import File, UploadFile, HTTPException
     import asyncio
     import shutil
     import uuid

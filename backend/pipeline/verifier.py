@@ -54,6 +54,7 @@ RULES:
 - If you find a value that was null but IS visible on a page, fill it in.
 - Do NOT hallucinate — if you can't find a value on any page, leave it as null.
 - "Exchange Rate (1)" on items is always the same as declaration Exchange Rate — do NOT change it.
+- CRITICAL for fee fields (CT, AT, SF, MF): Each fee must match its SPECIFIC labeled row in the tax/fee table. Do NOT shift values between fee fields. "Commercial Tax" goes to CT, "Security Fee" goes to SF, "MACCS" goes to MF. If a fee is 0, keep it 0.
 - Only CORRECT a value if the page image shows a DIFFERENT number. Do NOT remove values just because you can't find them on a specific page — they may come from a different page.
 - Return ONLY valid JSON.
 """
@@ -149,6 +150,14 @@ def verify(declaration: Dict, items: List[Dict], pages: List[Dict],
             )
             if resp.status_code == 200:
                 result = resp.json()
+
+                # Validate response structure before accessing
+                if "choices" not in result or not result["choices"]:
+                    print(f"    Verifier: malformed API response (no 'choices' key)")
+                    if attempt < 2:
+                        time.sleep(2 ** (attempt + 1))
+                    continue
+
                 if cost_tracker:
                     cost_tracker.record("verifier", result, model)
 

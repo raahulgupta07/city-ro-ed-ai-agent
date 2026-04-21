@@ -602,7 +602,7 @@ def save_declarations(job_id: str, declarations: List[Dict]):
             decl.get('Invoice Price', 0.0),
             decl.get('Currency', ''),
             decl.get('Exchange Rate', 0.0),
-            decl.get('Currency.1', ''),
+            decl.get('Currency 2', decl.get('Currency', '')),
             decl.get('Total Customs Value', 0.0),
             decl.get('Import/Export Customs Duty', 0.0),
             decl.get('Commercial Tax (CT)', 0.0),

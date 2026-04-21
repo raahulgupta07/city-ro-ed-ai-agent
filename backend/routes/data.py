@@ -205,21 +205,30 @@ async def download_items_excel(current_user: dict = Depends(get_current_user)):
 
     all_items = []
     for job in jobs:
+        decl_currency = ""
+        decls = database.get_job_declarations(job["job_id"])
+        if decls:
+            decl_currency = decls[0].get("currency", "")
         for item in database.get_job_items(job["job_id"]):
             all_items.append({
                 "Job": job["job_id"],
                 "Item Name": item.get("item_name", ""),
-                "Duty Rate": item.get("customs_duty_rate", ""),
-                "Quantity": item.get("quantity", ""),
-                "Unit Price": item.get("invoice_unit_price", ""),
-                "Tax %": item.get("commercial_tax_percent", ""),
-                "Exchange Rate": item.get("exchange_rate", ""),
-                "Date": job.get("created_at", ""),
+                "Customs Duty Rate": item.get("customs_duty_rate", ""),
+                "Quantity (1)": item.get("quantity", ""),
+                "Invoice Unit Price": item.get("invoice_unit_price", ""),
+                "Currency": decl_currency,
+                "Commercial Tax %": item.get("commercial_tax_percent", ""),
+                "Exchange Rate (1)": item.get("exchange_rate", ""),
+                "HS Code": item.get("hs_code", ""),
+                "Origin Country": item.get("origin_country", ""),
+                "Customs Value (MMK)": item.get("customs_value_mmk", ""),
+                "Processed": job.get("created_at", ""),
             })
 
-    df = pd.DataFrame(all_items) if all_items else pd.DataFrame(
-        columns=["Job", "Item Name", "Duty Rate", "Quantity", "Unit Price", "Tax %", "Exchange Rate", "Date"]
-    )
+    all_cols = ["Job", "Item Name", "Customs Duty Rate", "Quantity (1)", "Invoice Unit Price",
+                "Currency", "Commercial Tax %", "Exchange Rate (1)", "HS Code",
+                "Origin Country", "Customs Value (MMK)", "Processed"]
+    df = pd.DataFrame(all_items) if all_items else pd.DataFrame(columns=all_cols)
 
     output = BytesIO()
     with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
@@ -252,20 +261,26 @@ async def download_declarations_excel(current_user: dict = Depends(get_current_u
                 "Date": decl.get("declaration_date", ""),
                 "Importer": decl.get("importer_name", ""),
                 "Consignor": decl.get("consignor_name", ""),
+                "Invoice Number": decl.get("invoice_number", ""),
+                "Invoice Price": decl.get("invoice_price", ""),
                 "Currency": decl.get("currency", ""),
+                "Exchange Rate": decl.get("exchange_rate", ""),
+                "Currency 2": decl.get("currency_2", ""),
                 "Customs Value": decl.get("total_customs_value", ""),
                 "Duty": decl.get("import_export_customs_duty", ""),
                 "Tax": decl.get("commercial_tax_ct", ""),
                 "Income Tax": decl.get("advance_income_tax_at", ""),
                 "Security": decl.get("security_fee_sf", ""),
                 "MACCS": decl.get("maccs_service_fee_mf", ""),
+                "Exemption/Reduction": decl.get("exemption_reduction", ""),
                 "Processed": job.get("created_at", ""),
             })
 
-    df = pd.DataFrame(all_decls) if all_decls else pd.DataFrame(
-        columns=["Job", "Declaration No", "Date", "Importer", "Consignor", "Currency",
-                 "Customs Value", "Duty", "Tax", "Income Tax", "Security", "MACCS", "Processed"]
-    )
+    all_cols = ["Job", "Declaration No", "Date", "Importer", "Consignor",
+                "Invoice Number", "Invoice Price", "Currency", "Exchange Rate", "Currency 2",
+                "Customs Value", "Duty", "Tax", "Income Tax", "Security", "MACCS",
+                "Exemption/Reduction", "Processed"]
+    df = pd.DataFrame(all_decls) if all_decls else pd.DataFrame(columns=all_cols)
 
     output = BytesIO()
     with pd.ExcelWriter(output, engine='xlsxwriter') as writer:

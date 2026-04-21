@@ -102,6 +102,7 @@ Step 6:  ITEMS AGENT        — 9 column agents (json_schema enforced)
 Step 7:  ITEMS QA           — Re-run missing fields only
 Step 8:  CROSS-VALIDATION   — Items sum = declaration total
 Step 9:  VERIFIER           — Claude Sonnet checks against page images
+Step 10: FEE SHIFT FIX      — Deterministic correction for LLM fee field shifting
 ```
 
 ### Models
@@ -117,23 +118,45 @@ Step 9:  VERIFIER           — Claude Sonnet checks against page images
 
 ## Output Tables
 
-### Table 1: Product Items (9 fields per item)
+### Table 1: Product Items (12 columns in Excel)
 
-| Field | Description |
-|-------|-------------|
+| Column | Description |
+|--------|-------------|
+| Job | Job ID |
 | Item Name | Full product description |
-| Quantity (1) | Quantity with unit |
-| Invoice Unit Price | Price per unit in foreign currency |
-| Customs Value (MMK) | Value in local currency |
 | Customs Duty Rate | Duty as decimal (0.15 = 15%) |
+| Quantity (1) | Quantity with unit (e.g. "17,280 KG") |
+| Invoice Unit Price | Price per unit in foreign currency |
+| Currency | Invoice currency (from declaration) |
 | Commercial Tax % | Tax as decimal (0.05 = 5%) |
+| Exchange Rate (1) | Foreign to local currency rate |
 | HS Code | Harmonized system tariff code |
 | Origin Country | Country of origin |
-| Exchange Rate (1) | Foreign to local currency rate |
+| Customs Value (MMK) | Value in local currency |
+| Processed | Extraction timestamp |
 
-### Table 2: Customs Declaration (16 fields)
+### Table 2: Customs Declaration (18 columns)
 
-Declaration No, Date, Importer, Consignor, Invoice Number, Invoice Price, Currency, Currency 2, Exchange Rate, Total Customs Value, Customs Duty, Commercial Tax, Advance Income Tax, Security Fee, MACCS Service Fee, Exemption/Reduction
+| Column | Description |
+|--------|-------------|
+| Job | Job ID |
+| Declaration No | 12-digit customs declaration number |
+| Date | Declaration date (YYYY-MM-DD) |
+| Importer | Importing company name |
+| Consignor | Exporter/shipper name |
+| Invoice Number | Invoice reference (with prefix) |
+| Invoice Price | Total invoice amount in foreign currency |
+| Currency | Invoice currency (USD, THB, etc.) |
+| Exchange Rate | Conversion rate to MMK |
+| Currency 2 | Same as Currency |
+| Customs Value | Total CIF value in MMK |
+| Duty | Import/export customs duty |
+| Tax (CT) | Commercial tax |
+| Income Tax (AT) | Advance income tax |
+| Security (SF) | Security fee |
+| MACCS (MF) | MACCS service fee |
+| Exemption/Reduction | Tax exemption amount |
+| Processed | Extraction timestamp |
 
 ---
 
@@ -194,6 +217,10 @@ cd backend && python -m pipeline.pipeline /path/to/document.pdf
 | `{@const}` crash | `ReferenceError: X is not defined` in console | `{@const}` is block-scoped — don't reference outside its `{#if}`/`{#each}` |
 | 401 on some routes | Works in curl, fails in browser | Match trailing slashes in API paths exactly (`/users/` not `/users`) |
 | Results not loading after pipeline | WebSocket completes but no tables shown | Check `ws.py` sends `job_data` in `file_complete` message |
+| Fee values shifted (CT=0, AT has CT value) | CT/AT/SF/MF/Exemption off by 1 | Deterministic _fix_fee_shift runs post-verifier in pipeline.py + ws.py |
+| Declaration No shows as float (`.0`) | `100303470412.0` instead of `100303470412` | STRING_FIELDS in assembler.py skips numeric conversion |
+| Currency 2 always empty | Not saved to DB | Fixed key from `Currency.1` to `Currency 2` in database.py |
+| Missing columns in Excel | Only 15 columns instead of 18 | Added Job, Currency 2, Processed to all 3 export endpoints |
 
 ### Debug "LOADING..." Issues
 

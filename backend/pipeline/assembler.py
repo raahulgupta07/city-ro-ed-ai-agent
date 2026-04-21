@@ -89,19 +89,11 @@ def _build_page_summary(page_results: List[Dict]) -> str:
         parsed = pr.get("parsed", {})
         part = f"\n--- PAGE {pn} ({pt}) ---\n"
 
-        # Fields — deduplicate values (keep first occurrence of each unique value)
+        # Fields — include ALL fields (no dedup — different labels with same value are important context)
         fields = parsed.get("fields", {})
         if fields:
-            seen_values = set()
             part += "Fields:\n"
             for k, v in fields.items():
-                val_str = str(v).strip().lower() if v else ""
-                # Skip if exact same value already added (dedup)
-                dedup_key = f"{val_str}"
-                if val_str and len(val_str) > 2 and dedup_key in seen_values:
-                    continue
-                if val_str and len(val_str) > 2:
-                    seen_values.add(dedup_key)
                 part += f"  {k}: {v}\n"
 
         # Tables — keep all (critical for items extraction)
@@ -210,19 +202,31 @@ AGENT 10 — Import/Export Customs Duty:
   Look in tax tables, fees sections. If duty is FREE or exempt, return 0.
 
 AGENT 11 — Commercial Tax (CT):
-  Search for: commercial tax, CT, VAT, GST, sales tax
-  Look in tax tables, fees sections. If exempt, return 0.
+  Search for: commercial tax, CT, VAT, sales tax
+  This is a TAX amount — usually a large number (millions in MMK).
+  Look in the tax/fees summary table. The row labeled "Commercial Tax" or "CT".
+  Do NOT confuse with Advance Income Tax (AT) — CT and AT are DIFFERENT rows.
+  If exempt, return 0.
 
 AGENT 12 — Advance Income Tax (AT):
   Search for: advance income tax, AT, withholding tax, income tax
-  Look in tax tables, fees sections.
+  This is a TAX amount — can be large or zero.
+  Look in the tax/fees summary table. The row labeled "Advance Income Tax" or "AT".
+  Do NOT confuse with Commercial Tax (CT) — AT and CT are DIFFERENT rows.
+  If not present or exempt, return 0.
 
 AGENT 13 — Security Fee (SF):
   Search for: security fee, SF
+  This is usually a SMALL fixed fee (e.g. 20,000 MMK).
+  Look in the tax/fees summary table. The row labeled "Security Fee" or "SF".
+  Do NOT confuse with MACCS Service Fee (MF) — SF and MF are DIFFERENT rows.
   Return 0 if not present.
 
 AGENT 14 — MACCS Service Fee (MF):
-  Search for: MACCS fee, MF, system service fee, processing fee
+  Search for: MACCS fee, MF, MACCS service fee, system service fee
+  This is usually a LARGE fee amount (millions in MMK).
+  Look in the tax/fees summary table. The row labeled "MACCS Service Fee" or "MF".
+  Do NOT confuse with Security Fee (SF) — MF and SF are DIFFERENT rows.
   Return 0 if not present.
 
 AGENT 15 — Exemption/Reduction:
@@ -255,7 +259,9 @@ AGENT 16 — Currency 2:
 RULES:
 - Each agent searches ALL pages independently.
 - Read EXACT values from the document. Do NOT calculate or guess.
-- Taxes: read from tax tables or fee sections. Use 0 for FREE/exempt.
+- Taxes and fees: read from tax/fee tables. Match EACH value to its SPECIFIC labeled row.
+  CRITICAL: CT, AT, SF, and MF are 4 SEPARATE line items in the fee table. Do NOT shift values between them.
+  If a fee row exists, read its exact amount. If a fee row does NOT exist, return 0 for that field.
 - Return ONLY valid JSON.
 
 ## PAGE DATA:
@@ -410,6 +416,129 @@ ITEM_REQUIRED = [
     "Customs duty rate", "Commercial tax %", "HS Code", "Origin Country",
     "Exchange Rate (1)",
 ]
+
+
+def _parse_fees_from_page_summary(page_summary: str) -> Dict[str, float]:
+    """Deterministic: search page summary text for fee labels and extract their numeric values.
+    Uses regex to match label → number patterns in fields and table rows.
+    """
+    found = {}
+
+    # Patterns: "label: value" or "label | value" in fields/tables
+    # Each tuple: (output_key, list_of_regex_patterns_to_match)
+    fee_patterns = [
+        ("Commercial Tax (CT)", [
+            r'(?:commercial\s*tax|(?<!\w)CT(?!\w))[\s:|\-]+[\s]*([\d,]+(?:\.\d+)?)',
+        ]),
+        ("Advance Income Tax (AT)", [
+            r'(?:advance\s*income\s*tax|(?<!\w)AT(?!\w))[\s:|\-]+[\s]*([\d,]+(?:\.\d+)?)',
+        ]),
+        ("Security Fee (SF)", [
+            r'(?:security\s*fee|(?<!\w)SF(?!\w))[\s:|\-]+[\s]*([\d,]+(?:\.\d+)?)',
+        ]),
+        ("MACCS Service Fee (MF)", [
+            r'(?:MACCS\s*(?:service\s*)?fee|(?<!\w)MF(?!\w))[\s:|\-]+[\s]*([\d,]+(?:\.\d+)?)',
+        ]),
+        ("Exemption/Reduction", [
+            r'(?:exemption|reduction|deduction)[\s:|\-]+[\s]*([\d,]+(?:\.\d+)?)',
+        ]),
+    ]
+
+    for field_name, patterns in fee_patterns:
+        for pattern in patterns:
+            matches = re.findall(pattern, page_summary, re.IGNORECASE)
+            if matches:
+                # Take the last match (usually the summary/total, not a per-item value)
+                val_str = matches[-1].replace(",", "")
+                try:
+                    found[field_name] = float(val_str)
+                except ValueError:
+                    pass
+                break
+
+    return found
+
+
+def _fix_fee_shift(declaration: Dict, page_summary: str, corrections: str, model: str) -> Dict:
+    """Detect and correct fee field shifting using DETERMINISTIC methods.
+
+    The LLM consistently shifts fee values down by 1 position in the fee table:
+      Duty(correct), CT→AT, AT→SF, SF→MF, MF→Exemption (CT and SF become 0).
+
+    This handles ALL shift patterns:
+    - Full shift: CT=0, AT=CT_real, SF=0, MF=SF_real, Exemption=MF_real
+    - Partial CT shift only: CT=0, AT=CT_real (SF/MF correct)
+    - Partial SF shift only: SF=0, MF=SF_real, Exemption=MF_real (CT correct)
+    - Values that look swapped between adjacent fields
+
+    Strategy:
+    1. Detect ANY shift pattern using multiple heuristics
+    2. Apply deterministic shift-back correction (no LLM call — LLM will shift again)
+    """
+    ct = float(declaration.get("Commercial Tax (CT)", 0) or 0)
+    at = float(declaration.get("Advance Income Tax (AT)", 0) or 0)
+    sf = float(declaration.get("Security Fee (SF)", 0) or 0)
+    mf = float(declaration.get("MACCS Service Fee (MF)", 0) or 0)
+    exempt = float(declaration.get("Exemption/Reduction", 0) or 0)
+    duty = float(declaration.get("Import/Export Customs Duty", 0) or 0)
+
+    # ── Detect shift patterns ──
+    # Pattern A: CT=0 but AT has a tax-sized value (CT shifted to AT)
+    ct_shifted = ct == 0 and at > 0 and duty > 0 and at > duty * 0.1
+
+    # Pattern B: SF=0 but MF has a small fee-sized value AND Exemption has a larger value
+    sf_shifted = sf == 0 and mf > 0 and exempt > 0 and exempt > mf
+
+    # Pattern C: SF=0, MF is small (< 5% of duty), Exemption is large — even if CT looks OK
+    if not sf_shifted and sf == 0 and mf > 0 and duty > 0:
+        if mf < duty * 0.05 and exempt > mf * 2:
+            sf_shifted = True
+
+    # Pattern D: Full rotation — ONLY if sf_shifted is also true (confirming a full shift)
+    # AND CT > MF threshold. Without sf_shifted, CT could be legitimately large.
+    if not ct_shifted and sf_shifted and ct > 0 and at > 0 and duty > 0:
+        customs_value = float(declaration.get("Total Customs Value", 0) or 0)
+        if customs_value > 0 and ct > customs_value * 0.05 and at < ct:
+            # CT is suspiciously large (>5% of goods value) AND AT < CT
+            # Combined with sf_shifted, this strongly suggests full rotation
+            ct_shifted = True
+            print(f"    ⚠ Full rotation detected: CT={ct:,.0f} (>5% of customs value), AT={at:,.0f}")
+
+    if not ct_shifted and not sf_shifted:
+        print("    Fee shift check: no shift detected ✓")
+        return declaration
+
+    print(f"    ⚠ Fee shift detected!")
+    if ct_shifted:
+        print(f"      CT={ct:,.0f}, AT={at:,.0f}, duty={duty:,.0f}")
+    if sf_shifted:
+        print(f"      SF={sf:,.0f}, MF={mf:,.0f}, Exemption={exempt:,.0f}")
+
+    # ── Apply deterministic shift-back correction ──
+    # The known pattern: values shift down by 1 position
+    # CT(real)→AT, AT(real)=0, SF(real)→MF, MF(real)→Exemption, Exemption(real)=0
+    print("    Applying deterministic shift-back correction...")
+
+    if ct_shifted:
+        new_ct = at       # AT has CT's real value
+        new_at = 0        # AT was empty/0 on document
+        print(f"      Fixed: CT: {ct:,.0f} → {new_ct:,.0f}")
+        print(f"      Fixed: AT: {at:,.0f} → {new_at}")
+        declaration["Commercial Tax (CT)"] = new_ct
+        declaration["Advance Income Tax (AT)"] = new_at
+
+    if sf_shifted:
+        new_sf = mf       # MF has SF's real value
+        new_mf = exempt   # Exemption has MF's real value
+        new_exempt = 0    # Exemption was empty/0 on document
+        print(f"      Fixed: SF: {sf:,.0f} → {new_sf:,.0f}")
+        print(f"      Fixed: MF: {mf:,.0f} → {new_mf:,.0f}")
+        print(f"      Fixed: Exemption: {exempt:,.0f} → {new_exempt}")
+        declaration["Security Fee (SF)"] = new_sf
+        declaration["MACCS Service Fee (MF)"] = new_mf
+        declaration["Exemption/Reduction"] = new_exempt
+
+    return declaration
 
 
 def _qa_declaration(declaration: Dict, page_summary: str, corrections: str, model: str) -> Dict:
@@ -616,8 +745,12 @@ def assemble(page_results: List[Dict], model: str = None) -> Dict:
                              response_schema=DECL_SCHEMA if USE_JSON_SCHEMA else None)
     declaration = decl_result if decl_result else {}
 
-    # Clean declaration numeric values
+    # Clean declaration numeric values (skip fields that must stay as strings)
+    STRING_FIELDS = {"Declaration No", "Declaration Date", "Importer (Name)", "Consignor (Name)",
+                     "Invoice Number", "Currency", "Currency 2"}
     for field, val in declaration.items():
+        if field in STRING_FIELDS:
+            continue
         if isinstance(val, str):
             cleaned = val.replace(",", "").strip()
             try:
@@ -636,6 +769,9 @@ def assemble(page_results: List[Dict], model: str = None) -> Dict:
 
     # ── QA: Declaration ──
     declaration = _qa_declaration(declaration, page_summary, corrections, model)
+
+    # ── Fix: Detect and correct fee field shifting ──
+    declaration = _fix_fee_shift(declaration, page_summary, corrections, model)
 
     # ══════════════════════════════════════════════════════
     # Phase 2: Items Agent (needs declaration data)

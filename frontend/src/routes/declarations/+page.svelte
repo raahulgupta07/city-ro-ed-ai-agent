@@ -18,25 +18,35 @@
     { key: 'declaration_date', label: 'Date' },
     { key: 'importer_name', label: 'Importer' },
     { key: 'consignor_name', label: 'Consignor' },
+    { key: 'invoice_number', label: 'Invoice Number' },
+    { key: 'invoice_price', label: 'Invoice Price', align: 'right' as const },
     { key: 'currency', label: 'Currency' },
+    { key: 'exchange_rate', label: 'Exchange Rate', align: 'right' as const },
+    { key: 'currency_2', label: 'Currency 2' },
     { key: 'total_customs_value', label: 'Customs Value', align: 'right' as const },
     { key: 'import_export_customs_duty', label: 'Duty', align: 'right' as const },
     { key: 'commercial_tax_ct', label: 'Tax', align: 'right' as const },
     { key: 'advance_income_tax_at', label: 'Income Tax', align: 'right' as const },
     { key: 'security_fee_sf', label: 'Security', align: 'right' as const },
     { key: 'maccs_service_fee_mf', label: 'MACCS', align: 'right' as const },
+    { key: 'exemption_reduction', label: 'Exemption/Reduction', align: 'right' as const },
     { key: 'created_at', label: 'Processed' },
   ];
+
+  const fmtNum = (v: any) => v != null ? Number(v).toLocaleString() : '—';
 
   const filteredDeclarations = $derived(() => {
     let result = declarations.map(d => ({
       ...d,
-      total_customs_value: d.total_customs_value != null ? d.total_customs_value.toLocaleString() : '—',
-      import_export_customs_duty: d.import_export_customs_duty != null ? d.import_export_customs_duty.toLocaleString() : '—',
-      commercial_tax_ct: d.commercial_tax_ct != null ? d.commercial_tax_ct.toLocaleString() : '—',
-      advance_income_tax_at: d.advance_income_tax_at != null ? d.advance_income_tax_at.toLocaleString() : '—',
-      security_fee_sf: d.security_fee_sf != null ? d.security_fee_sf.toLocaleString() : '—',
-      maccs_service_fee_mf: d.maccs_service_fee_mf != null ? d.maccs_service_fee_mf.toLocaleString() : '—',
+      invoice_price: fmtNum(d.invoice_price),
+      exchange_rate: d.exchange_rate != null ? d.exchange_rate : '—',
+      total_customs_value: fmtNum(d.total_customs_value),
+      import_export_customs_duty: fmtNum(d.import_export_customs_duty),
+      commercial_tax_ct: fmtNum(d.commercial_tax_ct),
+      advance_income_tax_at: fmtNum(d.advance_income_tax_at),
+      security_fee_sf: fmtNum(d.security_fee_sf),
+      maccs_service_fee_mf: fmtNum(d.maccs_service_fee_mf),
+      exemption_reduction: fmtNum(d.exemption_reduction),
     }));
     if (searchQuery) {
       const q = searchQuery.toLowerCase();

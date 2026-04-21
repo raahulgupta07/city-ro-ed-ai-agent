@@ -56,13 +56,15 @@ def save_results(job_id: str, merged: Dict, validation: Dict,
         database.log_activity(user_id, username, action,
                               f"{len(items)} items, {accuracy:.1f}%")
 
-    # Save additional tables to DB as JSON
+    # Save additional tables — MERGE with existing cross_validation, don't overwrite
     additional_tables = merged.get("additional_tables", [])
     if additional_tables:
         try:
+            cv_data = cross_validation if cross_validation and isinstance(cross_validation, dict) else {}
+            cv_data["additional_tables"] = additional_tables
             conn = database._connect()
             conn.execute("UPDATE jobs SET cross_validation_json = ? WHERE job_id = ?",
-                         (json.dumps({"additional_tables": additional_tables}), job_id))
+                         (json.dumps(cv_data), job_id))
             conn.commit()
             conn.close()
         except Exception:

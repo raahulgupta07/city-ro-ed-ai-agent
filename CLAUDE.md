@@ -83,6 +83,7 @@ PDF Upload
   → Step 7:  ITEMS QA          — Re-run missing fields only
   → Step 8:  CROSS-VALIDATION  — Items sum = declaration total
   → Step 9:  VERIFIER          — Claude Sonnet checks against page images
+  → Step 10: FEE SHIFT FIX     — Deterministic post-verifier correction (see below)
   → Save to DB + Excel
 ```
 
@@ -104,6 +105,69 @@ PDF Upload
 - **Correction Memory** — user corrections feed back as few-shot examples
 - **Per-job isolation** — each job gets own files, own cost tracker, no global state
 - **Memory cleanup** — image data freed after verifier step
+- **Fee shift correction** — deterministic post-verifier fix for LLM fee field shifting (see below)
+
+## Fee Shift Correction (Step 10)
+
+LLMs (both Gemini and Claude) consistently shift fee/tax values down by 1 position when reading Myanmar customs documents:
+- CT→AT, SF→MF, MF→Exemption (CT and SF become 0)
+
+This happens at every pipeline layer (vision, assembler, verifier) because the document layout confuses the models.
+
+**Fix:** Deterministic post-verifier correction in `assembler.py:_fix_fee_shift()`:
+1. Detects 4 shift patterns (standard, SF-only, size-based, full rotation)
+2. Applies shift-back: CT=AT, AT=0, SF=MF, MF=Exemption, Exemption=0
+3. Runs AFTER verifier in both `pipeline.py` AND `ws.py` (so verifier can't overwrite)
+4. Zero LLM calls — 100% deterministic, can't re-shift
+
+**Don't:**
+- Don't use LLM re-calls to fix fee shifting (they shift the same way)
+- Don't move _fix_fee_shift before the verifier (verifier overwrites it)
+- Don't remove Pattern D guard (`sf_shifted` must also be true) — causes false positives
+
+## Output Tables — Column Definitions
+
+### Items Table (11 columns in UI, 12 in Excel)
+
+| Column | DB Key | Source |
+|--------|--------|--------|
+| Job | job_id | Auto-generated |
+| Item Name | item_name | Assembler |
+| Customs Duty Rate | customs_duty_rate | Assembler |
+| Quantity (1) | quantity | Assembler |
+| Invoice Unit Price | invoice_unit_price | Assembler |
+| Currency | currency | From declaration |
+| Commercial Tax % | commercial_tax_percent | Assembler |
+| Exchange Rate (1) | exchange_rate | Assembler |
+| HS Code | hs_code | Assembler |
+| Origin Country | origin_country | Assembler |
+| Customs Value (MMK) | customs_value_mmk | Assembler |
+| Processed | created_at | Auto-generated |
+
+### Declaration Table (18 columns)
+
+| Column | DB Key | Source |
+|--------|--------|--------|
+| Job | job_id | Auto-generated |
+| Declaration No | declaration_no | Assembler (STRING, not float) |
+| Date | declaration_date | Assembler |
+| Importer | importer_name | Assembler |
+| Consignor | consignor_name | Assembler |
+| Invoice Number | invoice_number | Assembler |
+| Invoice Price | invoice_price | Assembler |
+| Currency | currency | Assembler |
+| Exchange Rate | exchange_rate | Assembler |
+| Currency 2 | currency_2 | Assembler (fallback: Currency) |
+| Customs Value | total_customs_value | Assembler |
+| Duty | import_export_customs_duty | Assembler |
+| Tax (CT) | commercial_tax_ct | Assembler + fee shift fix |
+| Income Tax (AT) | advance_income_tax_at | Assembler + fee shift fix |
+| Security (SF) | security_fee_sf | Assembler + fee shift fix |
+| MACCS (MF) | maccs_service_fee_mf | Assembler + fee shift fix |
+| Exemption | exemption_reduction | Assembler + fee shift fix |
+| Processed | created_at | Auto-generated |
+
+**All 3 Excel exports (per-job, all-items, all-declarations) match these columns.**
 
 ## Concurrency (10 users)
 
@@ -145,6 +209,11 @@ cp .env.example .env   # Fill in OPENROUTER_API_KEY + JWT_SECRET_KEY
 - Don't use `res.json()` in `api.ts` — use `res.text()` + `JSON.parse()` (see troubleshooting)
 - Don't use `{@const}` and reference it outside its block scope in Svelte
 - Don't mutate `$state` array entries in-place for view transitions — replace with new object
+- Don't convert Declaration No to float — it's a string field (see STRING_FIELDS in assembler.py)
+- Don't save Currency 2 with key `Currency.1` — the assembler uses `Currency 2`
+- Don't use LLM calls to fix fee shifting — they shift the same way every time
+- Don't put _fix_fee_shift before verifier — verifier overwrites it
+- Don't define columns in only one place — sync UI, Excel exports, and API schemas together
 
 ## Known Issues & Troubleshooting
 

@@ -108,6 +108,9 @@ class ItemResponse(BaseModel):
     invoice_unit_price: Optional[str] = None
     commercial_tax_percent: Optional[float] = None
     exchange_rate: Optional[str] = None
+    hs_code: Optional[str] = None
+    origin_country: Optional[str] = None
+    customs_value_mmk: Optional[float] = None
     created_at: Optional[str] = None
 
 
