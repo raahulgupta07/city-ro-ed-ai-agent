@@ -51,10 +51,7 @@
     if (searchQuery) {
       const q = searchQuery.toLowerCase();
       result = result.filter(d =>
-        d.declaration_no?.toLowerCase().includes(q) ||
-        d.importer_name?.toLowerCase().includes(q) ||
-        d.consignor_name?.toLowerCase().includes(q) ||
-        d.job_id?.toLowerCase().includes(q)
+        Object.values(d).some(v => v != null && String(v).toLowerCase().includes(q))
       );
     }
     if (dateFrom) {
@@ -104,7 +101,7 @@
 <!-- Filters -->
 <div class="flex flex-wrap gap-3 items-end mb-4">
   <div class="flex-1 min-w-[200px]">
-    <input type="text" placeholder="Search declaration no, importer, consignor..."
+    <input type="text" placeholder="Search any column..."
            bind:value={searchQuery}
            class="w-full text-xs font-bold uppercase px-3 py-2 focus:outline-none"
            style="border: 2px solid var(--on-surface); background: white; color: var(--on-surface);" />

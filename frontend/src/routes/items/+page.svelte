@@ -32,9 +32,7 @@
     if (searchQuery) {
       const q = searchQuery.toLowerCase();
       result = result.filter(i =>
-        i.item_name?.toLowerCase().includes(q) ||
-        i.job_id?.toLowerCase().includes(q) ||
-        i.quantity?.toLowerCase().includes(q)
+        Object.values(i).some(v => v != null && String(v).toLowerCase().includes(q))
       );
     }
     if (dateFrom) {
@@ -84,7 +82,7 @@
 <!-- Filters -->
 <div class="flex flex-wrap gap-3 items-end mb-4">
   <div class="flex-1 min-w-[200px]">
-    <input type="text" placeholder="Search item name, job ID..."
+    <input type="text" placeholder="Search any column..."
            bind:value={searchQuery}
            class="w-full text-xs font-bold uppercase px-3 py-2 focus:outline-none"
            style="border: 2px solid var(--on-surface); background: white; color: var(--on-surface);" />
