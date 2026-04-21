@@ -796,10 +796,36 @@ def assemble(page_results: List[Dict], model: str = None) -> Dict:
                               response_schema=ITEMS_SCHEMA if USE_JSON_SCHEMA else None)
     items = items_result.get("items", []) if items_result else []
 
-    # Ensure exchange rate on every item
+    # Ensure exchange rate on every item + fallback Invoice Unit Price from CIF
     for item in items:
         if not item.get("Exchange Rate (1)") and declaration.get("Exchange Rate"):
             item["Exchange Rate (1)"] = declaration["Exchange Rate"]
+        # If Invoice Unit Price is missing but CIF exists, copy CIF as fallback
+        inv_price = item.get("Invoice unit price")
+        cif_price = item.get("CIF unit price")
+        if (inv_price is None or inv_price == 0 or str(inv_price).strip() == "") and cif_price:
+            item["Invoice unit price"] = cif_price
+            print(f"    Fallback: Invoice unit price missing, copied from CIF: {cif_price}")
+        # If CIF is missing but Invoice exists, copy Invoice as fallback
+        if (cif_price is None or cif_price == 0 or str(cif_price).strip() == "") and inv_price:
+            item["CIF unit price"] = inv_price
+            print(f"    Fallback: CIF unit price missing, copied from Invoice: {inv_price}")
+
+    # Deduplicate items (same item name + same HS code = duplicate)
+    if len(items) > 1:
+        seen = set()
+        unique_items = []
+        for item in items:
+            key = (str(item.get("Item name", "")).strip()[:50].lower(),
+                   str(item.get("HS Code", "")).strip())
+            if key not in seen:
+                seen.add(key)
+                unique_items.append(item)
+            else:
+                print(f"    Dedup: removed duplicate item '{str(item.get('Item name', ''))[:40]}...'")
+        if len(unique_items) < len(items):
+            print(f"    Dedup: {len(items)} → {len(unique_items)} items")
+            items = unique_items
 
     print(f"    Items: {len(items)} products")
 

@@ -56,6 +56,12 @@ def run_pipeline(
     if not pages:
         return None
 
+    # Guard: cap at 50 pages to prevent OOM (4GB container, 10 concurrent users)
+    MAX_PAGES = 50
+    if len(pages) > MAX_PAGES:
+        _log(f"⚠ PDF has {len(pages)} pages — capping at {MAX_PAGES} to prevent memory issues")
+        pages = pages[:MAX_PAGES]
+
     # ═══ Step 2: Vision AI reads every page ═══
     vision_model = config.VISION_MODEL or model
     _log(f"Step 2: Vision AI reading {len(pages)} pages... (model: {vision_model or config.EXTRACTION_MODEL})")
