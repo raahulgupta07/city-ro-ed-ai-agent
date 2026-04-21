@@ -484,6 +484,7 @@ async def download_job_excel(job_id: str, current_user: dict = Depends(get_curre
         # Sheet 1: Product Items (all 9 columns)
         items = job.get('items', [])
         items_data = [{
+            'Job': job_id,
             'Item Name': item.get('item_name', ''),
             'Customs Duty Rate': item.get('customs_duty_rate', ''),
             'Quantity (1)': item.get('quantity', ''),
@@ -495,10 +496,11 @@ async def download_job_excel(job_id: str, current_user: dict = Depends(get_curre
             'HS Code': item.get('hs_code', ''),
             'Origin Country': item.get('origin_country', ''),
             'Customs Value (MMK)': item.get('customs_value_mmk', ''),
+            'Processed': item.get('created_at', ''),
         } for item in items]
-        all_item_cols = ['Item Name', 'Customs Duty Rate', 'Quantity (1)', 'Invoice Unit Price',
+        all_item_cols = ['Job', 'Item Name', 'Customs Duty Rate', 'Quantity (1)', 'Invoice Unit Price',
                          'CIF Unit Price', 'Currency', 'Commercial Tax %', 'Exchange Rate (1)',
-                         'HS Code', 'Origin Country', 'Customs Value (MMK)']
+                         'HS Code', 'Origin Country', 'Customs Value (MMK)', 'Processed']
         df_items = pd.DataFrame(items_data, columns=all_item_cols) if items_data else pd.DataFrame(columns=all_item_cols)
         _style_sheet(writer, df_items, 'Product Items')
 
