@@ -102,6 +102,36 @@ async def submit_correction(req: CorrectionRequest, current_user: dict = Depends
     # Count corrections for this field to track learning progress
     field_count = database.get_correction_count_for_field(1, req.table_key, req.field_key)
 
+    # Auto-learn fee baseline when user corrects a fee field
+    FEE_FIELDS = {
+        "Commercial Tax (CT)", "Advance Income Tax (AT)",
+        "Security Fee (SF)", "MACCS Service Fee (MF)", "Exemption/Reduction",
+    }
+    if req.table_key == "declaration" and req.field_key in FEE_FIELDS:
+        try:
+            # Get importer name from this job's declaration
+            conn = database._connect()
+            row = conn.execute(
+                "SELECT importer_name, commercial_tax_ct, advance_income_tax_at, "
+                "security_fee_sf, maccs_service_fee_mf, exemption_reduction "
+                "FROM declarations WHERE job_id = ?", (req.job_id,)
+            ).fetchone()
+            conn.close()
+            if row and row[0]:
+                # Build baseline from current DB values (which now include this correction)
+                baseline = database.get_fee_baseline(row[0]) or {}
+                baseline.update({
+                    "CT": float(row[1] or 0),
+                    "AT": float(row[2] or 0),
+                    "SF": float(row[3] or 0),
+                    "MF": float(row[4] or 0),
+                    "Exemption": float(row[5] or 0),
+                    "verified": True,
+                })
+                database.save_fee_baseline(row[0], baseline)
+        except Exception:
+            pass
+
     return {
         "status": "ok",
         "correction_id": correction_id,

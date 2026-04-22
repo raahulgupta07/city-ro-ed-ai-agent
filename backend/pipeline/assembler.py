@@ -469,7 +469,158 @@ def _parse_fees_from_page_summary(page_summary: str) -> Dict[str, float]:
     return found
 
 
-def _fix_fee_shift(declaration: Dict, page_summary: str, corrections: str, model: str) -> Dict:
+def _search_page_summary_for_fee(page_summary: str, label_patterns: List[str]) -> float:
+    """Search raw page text for a fee label and extract its numeric value.
+
+    Searches ALL pages in the summary for ANY of the given label patterns.
+    If found on multiple pages, returns the value from the page with highest specificity
+    (labeled field > amount > table row).
+
+    Returns the value if found, or -1 if not found.
+    """
+    if not page_summary:
+        return -1
+
+    found_values = []
+    for label_pattern in label_patterns:
+        for pattern in [
+            # "Commercial Tax (CT): 93,794.28" or "Security Fee (SF): 0"
+            rf'{label_pattern}\s*[:=]\s*([\d,]+(?:\.\d+)?)',
+            # "Commercial tax Amount: 93,794.28"
+            rf'{label_pattern}\s+(?:Amount|Value)\s*[:=]?\s*([\d,]+(?:\.\d+)?)',
+            # "Security Fee (SF)": 0  (JSON-style in fields)
+            rf'"{label_pattern}[^"]*"\s*[:=]\s*([\d,]+(?:\.\d+)?)',
+        ]:
+            for match in re.finditer(pattern, page_summary, re.IGNORECASE):
+                try:
+                    found_values.append(float(match.group(1).replace(",", "")))
+                except ValueError:
+                    continue
+
+    if not found_values:
+        return -1
+
+    # If all found values agree, return that value
+    # If they disagree (e.g. per-item CT vs total CT), return the most common one
+    from collections import Counter
+    counts = Counter(found_values)
+    return counts.most_common(1)[0][0]
+
+
+def _is_fixed_fee(value: float) -> bool:
+    """Check if a value looks like a fixed government fee (SF or MF).
+    Myanmar customs fixed fees are typically 20,000 or 30,000 MMK.
+    """
+    return value > 0 and value <= 100_000
+
+
+# ═══════════════════════════════════════════════════════════════
+# FEE VERIFIER — LLM-based fee field mapping verification
+# ═══════════════════════════════════════════════════════════════
+
+FEE_VERIFY_PROMPT = """Below is the RAW extracted data from a customs document (extracted by a vision AI).
+The vision AI read every page and extracted fields, tables, and amounts with their labels.
+
+I then assembled these fee values from the raw data:
+  Import/Export Customs Duty: {duty}
+  Commercial Tax (CT): {ct}
+  Advance Income Tax (AT): {at}
+  Security Fee (SF): {sf}
+  MACCS Service Fee (MF): {mf}
+  Exemption/Reduction: {exempt}
+
+YOUR TASK: Check the RAW PAGE DATA below. Match each fee label to its correct value.
+
+The raw data contains fields like "Commercial Tax Amount: 93,794" or "Security: 0" or
+"Other taxes/fees Type: MF, Amount: 20,000". These are the ACTUAL labels from the document.
+Use these labels to verify the mapping above.
+
+For each fee:
+- Find the label in the raw data (e.g. "Commercial Tax", "Security Fee", "MACCS", "Advance Income Tax")
+- Read the value next to that label
+- If a fee label does NOT appear in the raw data, return 0
+- If a label appears but shows 0 or no amount, return 0
+
+Return ONLY this JSON:
+{{
+  "Commercial Tax (CT)": <number>,
+  "Advance Income Tax (AT)": <number>,
+  "Security Fee (SF)": <number>,
+  "MACCS Service Fee (MF)": <number>,
+  "Exemption/Reduction": <number>,
+  "confidence": <0.0-1.0 how confident you are>,
+  "reasoning": "<1-2 sentences: which labels you found and matched>"
+}}
+
+## RAW PAGE DATA:
+{page_data}"""
+
+
+def verify_fees_with_llm(declaration: Dict, page_results: List[Dict], model: str = None) -> Dict:
+    """Focused TEXT-BASED LLM call to verify fee field mapping.
+
+    Uses the raw page_summary (already extracted by vision) — NOT images.
+    This avoids the visual layout confusion that causes fee shifting.
+    The raw text has correct labels like "Security: 0", "Commercial Tax: 93,794".
+    The LLM just matches labels → values. Simple text task, no vision needed.
+
+    Cost: ~$0.002 (text only, no image tokens).
+
+    Returns: corrected fee values dict, or empty dict if verification fails.
+    """
+    model = model or config.EXTRACTION_MODEL
+
+    ct = declaration.get("Commercial Tax (CT)", 0) or 0
+    at = declaration.get("Advance Income Tax (AT)", 0) or 0
+    sf = declaration.get("Security Fee (SF)", 0) or 0
+    mf = declaration.get("MACCS Service Fee (MF)", 0) or 0
+    exempt = declaration.get("Exemption/Reduction", 0) or 0
+    duty = declaration.get("Import/Export Customs Duty", 0) or 0
+
+    # Build page summary from page_results (text only — no images)
+    page_data = _build_page_summary(page_results) if page_results else ""
+    if not page_data:
+        return {}
+
+    prompt = FEE_VERIFY_PROMPT.format(
+        duty=duty, ct=ct, at=at, sf=sf, mf=mf, exempt=exempt,
+        page_data=page_data,
+    )
+
+    payload = {
+        "model": model,
+        "messages": [{"role": "user", "content": prompt}],
+        "temperature": 0,
+        "max_tokens": 500,
+    }
+
+    try:
+        resp = requests.post(
+            "https://openrouter.ai/api/v1/chat/completions",
+            headers={"Authorization": f"Bearer {config.API_KEY}", "Content-Type": "application/json"},
+            json=payload, timeout=config.API_TIMEOUT,
+        )
+        if resp.status_code == 200:
+            result = resp.json()
+            if cost_tracker:
+                cost_tracker.record("fee_verify", result, model)
+
+            raw = result["choices"][0]["message"]["content"].strip()
+            cleaned = re.sub(r'```json\n?|```\n?', '', raw).strip()
+            if '{' in cleaned:
+                parsed = json.loads(cleaned[cleaned.index('{'):cleaned.rindex('}') + 1])
+                confidence = float(parsed.get("confidence", 0))
+                reasoning = parsed.get("reasoning", "")
+                print(f"    Fee verifier: confidence={confidence:.2f}, reasoning: {reasoning}")
+                return parsed
+    except Exception as e:
+        print(f"    Fee verifier error: {e}")
+
+    return {}
+
+
+def _fix_fee_shift(declaration: Dict, page_summary: str, corrections: str, model: str,
+                   job_id: str = None) -> Dict:
     """Detect and correct fee field shifting using DETERMINISTIC methods.
 
     The LLM consistently shifts fee values down by 1 position in the fee table:
@@ -481,9 +632,14 @@ def _fix_fee_shift(declaration: Dict, page_summary: str, corrections: str, model
     - Partial SF shift only: SF=0, MF=SF_real, Exemption=MF_real (CT correct)
     - Values that look swapped between adjacent fields
 
-    Strategy:
-    1. Detect ANY shift pattern using multiple heuristics
-    2. Apply deterministic shift-back correction (no LLM call — LLM will shift again)
+    Safety layers:
+    0. Importer fee baseline (if we've seen this importer before, use verified values)
+    1. Page text cross-check (search raw vision output for actual values)
+    2. Pattern detection with corroboration requirements
+    3. Page text override (contradict heuristics with document evidence)
+    4. Deterministic shift-back
+    5. Post-fix sanity check (verify result is more reasonable than original)
+    6. Audit trail (log every change to value_audit table)
     """
     ct = float(declaration.get("Commercial Tax (CT)", 0) or 0)
     at = float(declaration.get("Advance Income Tax (AT)", 0) or 0)
@@ -491,28 +647,154 @@ def _fix_fee_shift(declaration: Dict, page_summary: str, corrections: str, model
     mf = float(declaration.get("MACCS Service Fee (MF)", 0) or 0)
     exempt = float(declaration.get("Exemption/Reduction", 0) or 0)
     duty = float(declaration.get("Import/Export Customs Duty", 0) or 0)
+    customs_value = float(declaration.get("Total Customs Value", 0) or 0)
 
-    # ── Detect shift patterns ──
-    # Pattern A: CT=0 but AT has a tax-sized value (CT shifted to AT)
-    ct_shifted = ct == 0 and at > 0 and duty > 0 and at > duty * 0.1
+    # ══════════════════════════════════════════════════════
+    # Layer 0: Importer fee baseline
+    # If we have verified fee values from past corrections for this importer,
+    # use them as ground truth. This is the most reliable signal — it comes
+    # from a human who checked the actual document.
+    # ══════════════════════════════════════════════════════
+    importer_name = declaration.get("Importer (Name)", "")
+    baseline = {}
+    if importer_name:
+        try:
+            import database
+            baseline = database.get_fee_baseline(importer_name)
+        except Exception:
+            pass
+
+    if baseline and baseline.get("verified"):
+        print(f"    Fee baseline found for {importer_name}: {baseline}")
+
+        # Use baseline to detect shifts with HIGH confidence
+        # Baseline tells us the TYPICAL fee structure for this importer
+        baseline_sf = baseline.get("SF")
+        baseline_mf = baseline.get("MF")
+
+        # SF baseline check: if baseline says SF should be ~20,000 but current SF=0
+        # and current MF matches baseline SF → confirmed SF→MF shift
+        if baseline_sf is not None and baseline_sf > 0 and sf == 0 and mf > 0:
+            if abs(mf - baseline_sf) / max(baseline_sf, 1) < 0.1:  # MF ≈ baseline SF (within 10%)
+                print(f"    Baseline confirms SF→MF shift: SF=0, MF={mf:,.0f} ≈ baseline SF={baseline_sf:,.0f}")
+                declaration["Security Fee (SF)"] = mf
+                declaration["MACCS Service Fee (MF)"] = exempt
+                declaration["Exemption/Reduction"] = 0
+
+                changes = [
+                    ("Security Fee (SF)", sf, mf),
+                    ("MACCS Service Fee (MF)", mf, exempt),
+                    ("Exemption/Reduction", exempt, 0),
+                ]
+                print(f"      Fixed: SF: {sf:,.0f} → {mf:,.0f}")
+                print(f"      Fixed: MF: {mf:,.0f} → {exempt:,.0f}")
+                print(f"      Fixed: Exemption: {exempt:,.0f} → 0")
+
+                # Log audit
+                if job_id:
+                    try:
+                        for fk, ov, nv in changes:
+                            database.save_value_audit(job_id, "declaration", fk,
+                                "fee_shift_fix_baseline", str(ov), str(nv), "importer_baseline")
+                    except Exception:
+                        pass
+
+                # SF side fixed via baseline. Now check CT/AT — if baseline says CT=0 is normal,
+                # don't touch it. Otherwise fall through to pattern detection.
+                baseline_ct = baseline.get("CT")
+                if baseline_ct is not None and baseline_ct == 0 and ct == 0:
+                    print(f"    Baseline confirms CT=0 is normal for this importer ✓")
+                    return declaration
+
+                # If CT/AT don't match baseline pattern, fall through to Layer 2 for pattern check
+                print(f"    SF fixed via baseline. CT/AT will use pattern detection...")
+                # Update local vars for pattern detection below
+                sf = float(declaration.get("Security Fee (SF)", 0) or 0)
+                mf = float(declaration.get("MACCS Service Fee (MF)", 0) or 0)
+                exempt = float(declaration.get("Exemption/Reduction", 0) or 0)
+
+        # SF baseline check: baseline says SF=0 is genuine (e.g. certain document types)
+        elif baseline_sf is not None and baseline_sf == 0 and sf == 0:
+            print(f"    Baseline confirms SF=0 is normal for this importer ✓ (skip SF shift detection)")
+            # Skip SF shift detection below — we know SF=0 is correct
+
+    # ══════════════════════════════════════════════════════
+    # Layer 1: Page text cross-check
+    # Search the raw vision output for fee labels and their actual values.
+    # If we find explicit values in the document text, trust those over heuristics.
+    # ══════════════════════════════════════════════════════
+    page_sf = _search_page_summary_for_fee(page_summary, [
+        r'Security Fee \(SF\)', r'Security Fee', r'Security', r'SF',
+    ])
+    page_mf = _search_page_summary_for_fee(page_summary, [
+        r'MACCS Service Fee \(MF\)', r'MACCS Service Fee', r'MACCS',
+        r'Other taxes/fees', r'MF',
+    ])
+    page_ct = _search_page_summary_for_fee(page_summary, [
+        r'Commercial Tax \(CT\)', r'Commercial [Tt]ax', r'CT',
+    ])
+    page_at = _search_page_summary_for_fee(page_summary, [
+        r'Advance Income Tax \(AT\)', r'Advance[d]? [Ii]ncome [Tt]ax', r'AT',
+    ])
+
+    if page_sf >= 0 or page_mf >= 0 or page_ct >= 0 or page_at >= 0:
+        print(f"    Page text cross-check: SF={page_sf}, MF={page_mf}, CT={page_ct}, AT={page_at}")
+
+    # ══════════════════════════════════════════════════════
+    # Layer 2: Pattern-based shift detection
+    # Detect SF shift FIRST — more reliable (involves 3 fields).
+    # CT shift requires corroboration to avoid false positives.
+    # ══════════════════════════════════════════════════════
 
     # Pattern B: SF=0 but MF has a small fee-sized value AND Exemption has a larger value
     sf_shifted = sf == 0 and mf > 0 and exempt > 0 and exempt > mf
 
-    # Pattern C: SF=0, MF is small (< 5% of duty), Exemption is large — even if CT looks OK
+    # Pattern C: SF=0, MF is a fee-sized value (< 5% of duty) — SF shifted to MF position.
+    # Does NOT require Exemption > 0, because real MF could be 0 (Exemption holds 0 after shift).
     if not sf_shifted and sf == 0 and mf > 0 and duty > 0:
-        if mf < duty * 0.05 and exempt > mf * 2:
+        if mf < duty * 0.05:
             sf_shifted = True
 
-    # Pattern D: Full rotation — ONLY if sf_shifted is also true (confirming a full shift)
-    # AND CT > MF threshold. Without sf_shifted, CT could be legitimately large.
-    if not ct_shifted and sf_shifted and ct > 0 and at > 0 and duty > 0:
-        customs_value = float(declaration.get("Total Customs Value", 0) or 0)
-        if customs_value > 0 and ct > customs_value * 0.05 and at < ct:
-            # CT is suspiciously large (>5% of goods value) AND AT < CT
-            # Combined with sf_shifted, this strongly suggests full rotation
+    # Pattern A: CT=0 but AT has a tax-sized value (CT shifted to AT)
+    # GUARD: Only trigger if sf_shifted is also true (systemic shift) or SF is also 0.
+    # If SF has a real non-zero value and is NOT shifted, the fee table is not
+    # systemically shifted — CT=0 is likely genuine (e.g. tax-exempt goods).
+    ct_shifted = (ct == 0 and at > 0 and duty > 0 and at > duty * 0.1
+                  and (sf_shifted or sf == 0))
+
+    # Pattern D: Full rotation — ONLY if sf_shifted is also true AND AT is literally 0.
+    # CT=0 is a legitimate pattern in Myanmar customs docs (tax-exempt goods), so
+    # sf_shifted alone is NOT enough. Requiring AT=0 provides stronger evidence that
+    # the CT/AT pair was also shifted (real AT is 0, real CT ended up in AT position).
+    if not ct_shifted and sf_shifted and ct > 0 and at == 0 and duty > 0:
+        if customs_value > 0 and ct > customs_value * 0.01:
             ct_shifted = True
-            print(f"    ⚠ Full rotation detected: CT={ct:,.0f} (>5% of customs value), AT={at:,.0f}")
+            print(f"    ⚠ Full rotation detected: CT={ct:,.0f}, AT=0 (with sf_shifted)")
+
+    # ══════════════════════════════════════════════════════
+    # Layer 3: Page text override
+    # If raw page text has explicit values that contradict the shift detection,
+    # trust the page text. This catches false positives AND false negatives.
+    # ══════════════════════════════════════════════════════
+    if ct_shifted and page_ct >= 0 and page_ct == ct:
+        # Page text confirms CT's current value — NOT shifted
+        print(f"    Page text override: CT={page_ct:,.0f} confirmed in document → skip CT shift")
+        ct_shifted = False
+
+    if ct_shifted and page_at >= 0 and page_at == at:
+        # Page text confirms AT's current value — NOT shifted
+        print(f"    Page text override: AT={page_at:,.0f} confirmed in document → skip CT shift")
+        ct_shifted = False
+
+    if sf_shifted and page_sf >= 0 and page_sf == sf:
+        # Page text confirms SF's current value (even if 0) — NOT shifted
+        print(f"    Page text override: SF={page_sf:,.0f} confirmed in document → skip SF shift")
+        sf_shifted = False
+
+    if sf_shifted and page_mf >= 0 and page_mf == mf:
+        # Page text confirms MF's current value — NOT shifted
+        print(f"    Page text override: MF={page_mf:,.0f} confirmed in document → skip SF shift")
+        sf_shifted = False
 
     if not ct_shifted and not sf_shifted:
         print("    Fee shift check: no shift detected ✓")
@@ -524,14 +806,17 @@ def _fix_fee_shift(declaration: Dict, page_summary: str, corrections: str, model
     if sf_shifted:
         print(f"      SF={sf:,.0f}, MF={mf:,.0f}, Exemption={exempt:,.0f}")
 
-    # ── Apply deterministic shift-back correction ──
-    # The known pattern: values shift down by 1 position
-    # CT(real)→AT, AT(real)=0, SF(real)→MF, MF(real)→Exemption, Exemption(real)=0
+    # ══════════════════════════════════════════════════════
+    # Layer 4: Apply deterministic shift-back correction
+    # ══════════════════════════════════════════════════════
     print("    Applying deterministic shift-back correction...")
+    changes = []  # Track changes for audit trail
 
     if ct_shifted:
         new_ct = at       # AT has CT's real value
         new_at = 0        # AT was empty/0 on document
+        changes.append(("Commercial Tax (CT)", ct, new_ct))
+        changes.append(("Advance Income Tax (AT)", at, new_at))
         print(f"      Fixed: CT: {ct:,.0f} → {new_ct:,.0f}")
         print(f"      Fixed: AT: {at:,.0f} → {new_at}")
         declaration["Commercial Tax (CT)"] = new_ct
@@ -541,12 +826,71 @@ def _fix_fee_shift(declaration: Dict, page_summary: str, corrections: str, model
         new_sf = mf       # MF has SF's real value
         new_mf = exempt   # Exemption has MF's real value
         new_exempt = 0    # Exemption was empty/0 on document
+        changes.append(("Security Fee (SF)", sf, new_sf))
+        changes.append(("MACCS Service Fee (MF)", mf, new_mf))
+        changes.append(("Exemption/Reduction", exempt, new_exempt))
         print(f"      Fixed: SF: {sf:,.0f} → {new_sf:,.0f}")
         print(f"      Fixed: MF: {mf:,.0f} → {new_mf:,.0f}")
         print(f"      Fixed: Exemption: {exempt:,.0f} → {new_exempt}")
         declaration["Security Fee (SF)"] = new_sf
         declaration["MACCS Service Fee (MF)"] = new_mf
         declaration["Exemption/Reduction"] = new_exempt
+
+    # ══════════════════════════════════════════════════════
+    # Layer 5: Post-fix sanity check
+    # Verify the corrected values are more reasonable than originals.
+    # If not, REVERT and log a warning.
+    # ══════════════════════════════════════════════════════
+    new_ct_val = float(declaration.get("Commercial Tax (CT)", 0) or 0)
+    new_at_val = float(declaration.get("Advance Income Tax (AT)", 0) or 0)
+    new_sf_val = float(declaration.get("Security Fee (SF)", 0) or 0)
+    new_mf_val = float(declaration.get("MACCS Service Fee (MF)", 0) or 0)
+    new_exempt_val = float(declaration.get("Exemption/Reduction", 0) or 0)
+
+    failed_sanity = False
+
+    # Check 1: No fee should exceed customs value
+    if customs_value > 0:
+        for fname, fval in [("CT", new_ct_val), ("AT", new_at_val), ("SF", new_sf_val),
+                            ("MF", new_mf_val), ("Exemption", new_exempt_val)]:
+            if fval > customs_value:
+                print(f"    ⚠ SANITY FAIL: {fname}={fval:,.0f} exceeds customs value={customs_value:,.0f}")
+                failed_sanity = True
+
+    # Check 2: CT should not exceed duty (CT is typically % of goods value, not > duty)
+    if new_ct_val > 0 and duty > 0 and new_ct_val > duty * 5:
+        print(f"    ⚠ SANITY FAIL: CT={new_ct_val:,.0f} is 5x larger than duty={duty:,.0f}")
+        failed_sanity = True
+
+    # Check 3: SF and MF should be fixed-fee sized (<=100,000) if non-zero
+    if new_sf_val > 0 and not _is_fixed_fee(new_sf_val):
+        print(f"    ⚠ SANITY WARN: SF={new_sf_val:,.0f} is unusually large for a fixed fee")
+    if new_mf_val > 0 and not _is_fixed_fee(new_mf_val):
+        print(f"    ⚠ SANITY WARN: MF={new_mf_val:,.0f} is unusually large for a fixed fee")
+
+    if failed_sanity:
+        # REVERT all changes
+        print("    ⚠ REVERTING fee shift correction — sanity check failed!")
+        for field_key, old_val, _new_val in changes:
+            declaration[field_key] = old_val
+        print("    Fee values restored to original extraction.")
+        return declaration
+
+    # ══════════════════════════════════════════════════════
+    # Layer 6: Audit trail — log every change
+    # ══════════════════════════════════════════════════════
+    if job_id and changes:
+        try:
+            import database
+            for field_key, old_val, new_val in changes:
+                database.save_value_audit(
+                    job_id=job_id, table_key="declaration", field_key=field_key,
+                    stage="fee_shift_fix", old_value=str(old_val), new_value=str(new_val),
+                    source="deterministic_shift_back"
+                )
+            print(f"    Audit: {len(changes)} changes logged to value_audit")
+        except Exception as e:
+            print(f"    Audit log failed (non-critical): {e}")
 
     return declaration
 

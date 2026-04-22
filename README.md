@@ -1,6 +1,6 @@
 # RO-ED AI Agent
 
-Document intelligence system that extracts structured data from import/export PDF documents using AI vision + Master Agent architecture with self-learning.
+Document intelligence system that extracts structured data from import/export PDF documents using AI vision + Master Agent architecture with self-learning and fee verification.
 
 Built by **City AI Team** — City Holdings Myanmar
 
@@ -9,7 +9,7 @@ Built by **City AI Team** — City Holdings Myanmar
 ## How It Works
 
 ```
-PDF → HD Images → Vision AI per page → QA → Master Agents → QA → Verifier → Results
+PDF → HD Images → Vision AI per page → QA → Master Agents → QA → Verifier → Fee Verify → Results
 ```
 
 12 steps. No Tesseract. No hardcoding. Zero calculations. Every value read directly from the document.
@@ -20,6 +20,8 @@ PDF → HD Images → Vision AI per page → QA → Master Agents → QA → Ver
 
 - **Master + Column Agent architecture** — Declaration (16 agents), Items (9 agents per product)
 - **Claude Sonnet verification** — Premium model cross-checks every value against source page images
+- **Fee verification** — Text-based LLM verifies fee-label mapping + 7-layer deterministic fallback
+- **Fee self-learning** — User corrections auto-save fee baselines per importer for future accuracy
 - **json_schema enforced** — Guaranteed valid JSON output, all fields present, zero parse errors
 - **Token optimized** — Deduplicated fields, no metadata sent to assembler (~11% savings)
 - **Self-learning** — User corrections feed back as few-shot examples
@@ -39,7 +41,7 @@ PDF → HD Images → Vision AI per page → QA → Master Agents → QA → Ver
 - **REST API** — `POST /api/extract` for headless integration
 - **Batch processing** — Multiple PDFs with real-time streaming terminal
 - **100% accuracy** — Tested on 12 verified customs PDFs, zero corrections needed
-- **Cost: ~$0.14-0.18 per PDF**
+- **Cost: ~$0.15-0.20 per PDF**
 
 ---
 
@@ -52,6 +54,7 @@ PDF → HD Images → Vision AI per page → QA → Master Agents → QA → Ver
 | Database | SQLite (WAL mode, 30s busy_timeout) |
 | Vision + Assembler | Google Gemini 3 Flash Preview via OpenRouter |
 | Verifier | Anthropic Claude Sonnet 4.6 via OpenRouter |
+| Fee Verifier | Google Gemini 3 Flash Preview (text-based, ~$0.002/call) |
 | PDF | PyMuPDF at 300 DPI + Pillow (NO Tesseract) |
 | Auth | Local JWT + Keycloak OIDC |
 | Container | Docker (4GB RAM, 2 CPUs) |
@@ -104,17 +107,35 @@ Step 8:  ITEM DEDUP         — Remove duplicate items (same name + HS code)
 Step 9:  PRICE FALLBACK     — Copy Invoice↔CIF price if one is missing
 Step 10: CROSS-VALIDATION   — Items sum = declaration total
 Step 11: VERIFIER           — Claude Sonnet checks against page images
-Step 12: FEE SHIFT FIX      — Deterministic correction for LLM fee field shifting
+Step 12: FEE VERIFY         — Text LLM verifies fee-label mapping (deterministic fallback)
 ```
 
 ### Models
 
-| Step | Model | Role |
-|------|-------|------|
-| Vision | Gemini 3 Flash | Read each page image → JSON |
-| Declaration Agent | Gemini 3 Flash | 16 column agents find declaration fields |
-| Items Agent | Gemini 3 Flash | 9 column agents find item fields |
-| Verifier | Claude Sonnet 4.6 | Cross-check all values against page images |
+| Step | Model | Role | Cost |
+|------|-------|------|------|
+| Vision | Gemini 3 Flash | Read each page image → JSON | ~$0.002/page |
+| Declaration Agent | Gemini 3 Flash | 16 column agents find declaration fields | ~$0.01 |
+| Items Agent | Gemini 3 Flash | 9 column agents find item fields | ~$0.01 |
+| Verifier | Claude Sonnet 4.6 | Cross-check all values against page images | ~$0.12 |
+| Fee Verifier | Gemini 3 Flash | Verify fee-label mapping using raw page text | ~$0.002 |
+
+### Fee Verification (Step 12)
+
+LLMs consistently shift fee/tax values down by 1 position in Myanmar customs documents (CT→AT, SF→MF).
+
+**How it's solved:**
+
+1. **Primary:** Text-based LLM call (`verify_fees_with_llm()`) — sends the raw vision output text (not images) to the LLM and asks it to match fee labels to values. Uses text to avoid the visual layout confusion that causes shifting. Cost: ~$0.002.
+
+2. **Fallback:** 7-layer deterministic correction (`_fix_fee_shift()`) if LLM returns low confidence:
+   - Importer baseline (learned from past user corrections)
+   - Page text cross-check + override
+   - Pattern detection with corroboration guards
+   - Post-fix sanity check (auto-reverts impossible values)
+   - Audit trail
+
+3. **Self-learning:** When a user corrects a fee field in the UI, the correct fee pattern is saved per importer. Future extractions for the same importer use this as ground truth.
 
 ---
 
@@ -203,7 +224,7 @@ cd backend && python -m pipeline.pipeline /path/to/document.pdf
 | Metric | Value |
 |--------|-------|
 | Accuracy | 100% (12 PDFs, zero corrections) |
-| Cost | $0.14-0.18 per PDF |
+| Cost | $0.15-0.20 per PDF |
 | Speed | 60-130s per PDF |
 | Max pages tested | 29 pages (cap: 50) |
 | Max items | 21 per document |
@@ -220,8 +241,8 @@ cd backend && python -m pipeline.pipeline /path/to/document.pdf
 | `{@const}` crash | `ReferenceError: X is not defined` in console | `{@const}` is block-scoped — don't reference outside its `{#if}`/`{#each}` |
 | 401 on some routes | Works in curl, fails in browser | Match trailing slashes in API paths exactly (`/users/` not `/users`) |
 | Results not loading after pipeline | WebSocket completes but no tables shown | Check `ws.py` sends `job_data` in `file_complete` message |
-| Fee values shifted (CT=0, AT has CT value) | CT/AT/SF/MF/Exemption off by 1 | Deterministic _fix_fee_shift runs post-verifier in pipeline.py + ws.py |
-| Declaration No shows as float (`.0`) | `100303470412.0` instead of `100303470412` | STRING_FIELDS in assembler.py skips numeric conversion |
+| Fee values shifted | CT/AT/SF/MF off by 1 position | Step 12 fee verification: text LLM + 7-layer deterministic fallback + self-learning |
+| Declaration No shows as float | `100303470412.0` instead of `100303470412` | STRING_FIELDS in assembler.py skips numeric conversion |
 | Currency 2 always empty | Not saved to DB | Fixed key from `Currency.1` to `Currency 2` in database.py |
 | Missing columns in Excel | Only 15 columns instead of 18 | Added Job, Currency 2, Processed to all 3 export endpoints |
 

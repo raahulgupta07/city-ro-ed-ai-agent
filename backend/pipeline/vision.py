@@ -74,7 +74,18 @@ RULES:
 - For tables: copy EXACT column headers and ALL rows.
 - Numbers: commas are thousands separators (72,802 = 72802).
 - If text is small, zoom in mentally and read carefully.
-- Return ONLY valid JSON."""
+- Return ONLY valid JSON.
+
+IMPORTANT — Fee/Tax Fields:
+If this page has a tax or fee table/section, extract EACH fee as a SEPARATE labeled field:
+  "Commercial Tax (CT)": <amount or 0>,
+  "Advance Income Tax (AT)": <amount or 0>,
+  "Security Fee (SF)": <amount or 0>,
+  "MACCS Service Fee (MF)": <amount or 0>,
+  "Exemption/Reduction": <amount or 0>
+Read each fee from its OWN labeled row. Do NOT shift values between rows.
+If a fee label exists but has no amount, set it to 0.
+If a fee label does not exist on this page, do NOT include it."""
 
 
 def extract_page(page: Dict, model: str = None) -> Dict:

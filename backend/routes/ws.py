@@ -257,16 +257,6 @@ async def run_batch(ws: WebSocket):
                 corrections = verified.get("corrections", [])
                 dur4 = time.time() - t4
 
-                # Fee shift correction (deterministic, post-verifier)
-                try:
-                    from pipeline.assembler import _fix_fee_shift, _build_page_summary
-                    ps = _build_page_summary(page_results)
-                    declaration = _fix_fee_shift(declaration, ps, "", None)
-                except Exception:
-                    pass
-
-                filled = sum(1 for v in declaration.values() if v is not None)
-
                 if corrections:
                     await log(f"Verifier found {len(corrections)} corrections in {dur4:.1f}s:", "warning")
                     for c in corrections:
@@ -275,7 +265,53 @@ async def run_batch(ws: WebSocket):
                 else:
                     await log(f"All values verified correct in {dur4:.1f}s", "success")
 
+                filled = sum(1 for v in declaration.values() if v is not None)
                 await step(4, "AI_VERIFIER", "done", f"{filled}/16 fields verified ({dur4:.1f}s)")
+
+                # Free image memory after verifier (fee verify uses text, not images)
+                for p in pages:
+                    p.pop("image_b64", None)
+
+                # Fee verification — text LLM (primary) + deterministic (fallback)
+                await log("Verifying fee field mapping against raw page data...", "detail")
+                try:
+                    from pipeline.assembler import verify_fees_with_llm, _fix_fee_shift, _build_page_summary
+                    fee_result = await asyncio.to_thread(verify_fees_with_llm, declaration, page_results)
+
+                    fee_fields = ["Commercial Tax (CT)", "Advance Income Tax (AT)",
+                                  "Security Fee (SF)", "MACCS Service Fee (MF)", "Exemption/Reduction"]
+                    fee_confidence = float(fee_result.get("confidence", 0)) if fee_result else 0
+
+                    if fee_result and fee_confidence >= 0.7:
+                        changes = []
+                        for field in fee_fields:
+                            new_val = fee_result.get(field)
+                            if new_val is not None:
+                                old_val = declaration.get(field, 0) or 0
+                                try:
+                                    new_val = float(new_val)
+                                except (ValueError, TypeError):
+                                    continue
+                                if abs(float(old_val or 0) - new_val) > 0.01:
+                                    changes.append((field, old_val, new_val))
+                                declaration[field] = new_val
+                        if changes:
+                            await log(f"Fee verifier corrected {len(changes)} fields (conf={fee_confidence:.2f}):", "warning")
+                            for field, old_val, new_val in changes:
+                                await log(f"  {field}: {old_val} → {new_val}", "warning")
+                        else:
+                            await log(f"Fee values confirmed correct (conf={fee_confidence:.2f})", "success")
+                    else:
+                        await log("Fee verifier low confidence — using deterministic fallback", "detail")
+                        ps = _build_page_summary(page_results)
+                        declaration = _fix_fee_shift(declaration, ps, "", None, job_id=job_id)
+                except Exception as e:
+                    await log(f"Fee verification failed ({e}) — using deterministic fallback", "detail")
+                    try:
+                        ps = _build_page_summary(page_results)
+                        declaration = _fix_fee_shift(declaration, ps, "", None, job_id=job_id)
+                    except Exception:
+                        pass
 
                 # ════════════════════════════════════════════
                 # STEP 5: VALIDATE + SAVE

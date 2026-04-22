@@ -85,19 +85,53 @@ def run_pipeline(
     _log(f"Step 4: AI verifying... (model: {verifier_model or config.EXTRACTION_MODEL})")
     verified = verify(declaration, items, pages, model=verifier_model)
 
-    # Free image memory after verifier (no longer needed)
-    for p in pages:
-        p.pop("image_b64", None)
     declaration = verified.get("declaration", declaration)
     items = verified.get("items", items)
     corrections = verified.get("corrections", [])
     filled = sum(1 for v in declaration.values() if v is not None)
     _log(f"Verified: {filled}/16 fields, {len(corrections)} corrections")
 
-    # ═══ Step 5: Fee shift correction (deterministic, post-verifier) ═══
-    from pipeline.assembler import _fix_fee_shift, _build_page_summary
-    page_summary = _build_page_summary(page_results)
-    declaration = _fix_fee_shift(declaration, page_summary, "", None)
+    # Free image memory after verifier (no longer needed — fee verify uses text, not images)
+    for p in pages:
+        p.pop("image_b64", None)
+
+    # ═══ Step 5: Fee verification — LLM text-based (primary) + deterministic (fallback) ═══
+    from pipeline.assembler import verify_fees_with_llm, _fix_fee_shift, _build_page_summary
+
+    # Primary: Focused text LLM call to verify fee mapping using raw page data
+    _log("Step 5: Verifying fee field mapping...")
+    fee_result = verify_fees_with_llm(declaration, page_results)
+
+    fee_fields = ["Commercial Tax (CT)", "Advance Income Tax (AT)",
+                  "Security Fee (SF)", "MACCS Service Fee (MF)", "Exemption/Reduction"]
+    fee_confidence = float(fee_result.get("confidence", 0)) if fee_result else 0
+
+    if fee_result and fee_confidence >= 0.7:
+        # LLM fee verification succeeded with good confidence — apply its values
+        changes = []
+        for field in fee_fields:
+            new_val = fee_result.get(field)
+            if new_val is not None:
+                old_val = declaration.get(field, 0) or 0
+                try:
+                    new_val = float(new_val)
+                except (ValueError, TypeError):
+                    continue
+                if abs(float(old_val or 0) - new_val) > 0.01:
+                    changes.append((field, old_val, new_val))
+                declaration[field] = new_val
+
+        if changes:
+            _log(f"Fee verifier corrected {len(changes)} fields (confidence={fee_confidence:.2f}):")
+            for field, old_val, new_val in changes:
+                _log(f"  {field}: {old_val} → {new_val}")
+        else:
+            _log(f"Fee verifier confirmed all values correct (confidence={fee_confidence:.2f})")
+    else:
+        # Fallback: deterministic correction
+        _log("Fee verifier unavailable or low confidence — using deterministic fallback")
+        page_summary = _build_page_summary(page_results)
+        declaration = _fix_fee_shift(declaration, page_summary, "", None)
 
     # ═══ Compute accuracy ═══
     total_fields = filled + sum(sum(1 for v in item.values() if v is not None) for item in items)

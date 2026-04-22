@@ -2,7 +2,7 @@
 
 ## What This Project Is
 
-RO-ED AI Agent — document intelligence system that extracts structured data from import/export PDF documents. Master + Column Agent architecture with LLM verification and self-learning. Built by City AI Team — City Holdings Myanmar.
+RO-ED AI Agent — document intelligence system that extracts structured data from import/export PDF documents. Master + Column Agent architecture with LLM verification, fee verification, and self-learning. Built by City AI Team — City Holdings Myanmar.
 
 ## Tech Stack
 
@@ -12,6 +12,7 @@ RO-ED AI Agent — document intelligence system that extracts structured data fr
 - **AI Models:** OpenRouter API (per-step model config)
   - Vision + Assembler: Google Gemini 3 Flash Preview (page extraction + table building)
   - Verifier: Anthropic Claude Sonnet 4.6 (cross-checks against images)
+  - Fee Verifier: Gemini 3 Flash (text-based fee mapping verification)
 - **Auth:** Dual-mode — Local JWT (HS256) + Keycloak OIDC (RS256 via PKCE)
 - **Container:** Docker (single service, 4GB RAM, non-root user)
 - **PDF Processing:** PyMuPDF (fitz) at 300 DPI + Pillow enhancement. NO Tesseract.
@@ -50,19 +51,20 @@ RO-ED-Lang/
     │   ├── auth.py          # Login, JWT, Keycloak
     │   ├── jobs.py          # Upload (10 files max, 50MB each), details, Excel, annotated PDF
     │   ├── ws.py            # WebSocket — real-time pipeline streaming
-    │   ├── corrections.py   # User corrections → few-shot learning
+    │   ├── corrections.py   # User corrections → few-shot learning + fee baseline auto-save
     │   ├── data.py / users.py / settings.py / groups.py
     ├── pipeline/            # THE extraction pipeline
     │   ├── splitter.py      # PDF → 300 DPI HD images (PyMuPDF + Pillow)
-    │   ├── vision.py        # Per-page agents (parallel, semaphore=16) + QA gate
+    │   ├── vision.py        # Per-page agents (parallel, semaphore=16) + QA gate + explicit fee labels
     │   ├── assembler.py     # Master + Column Agents:
     │   │                      Declaration Master (16 column agents, json_schema)
     │   │                      Items Master (10 column agents, json_schema)
     │   │                      QA after each + cross-validation + item dedup
-    │   │                      Fee shift detection + deterministic correction
+    │   │                      verify_fees_with_llm() — text-based fee verification
+    │   │                      _fix_fee_shift() — 7-layer deterministic fallback
     │   │                      Token-optimized (dedup fields, no metadata)
     │   ├── verifier.py      # Claude Sonnet cross-checks against page images
-    │   └── pipeline.py      # Orchestrator (memory cleanup after verifier)
+    │   └── pipeline.py      # Orchestrator (fee verify → memory cleanup)
     ├── v2/                  # Shared utilities
     │   ├── confidence.py    # Per-field confidence scoring
     │   ├── step5_report.py  # Save results to DB (per-job files)
@@ -86,7 +88,7 @@ PDF Upload
   → Step 9:  PRICE FALLBACK    — Copy Invoice↔CIF price if one is missing
   → Step 10: CROSS-VALIDATION  — Items sum = declaration total
   → Step 11: VERIFIER          — Claude Sonnet checks against page images
-  → Step 12: FEE SHIFT FIX     — Deterministic post-verifier correction (see below)
+  → Step 12: FEE VERIFY        — Text LLM verifies fee-label mapping (deterministic fallback)
   → Save to DB + Excel
   → Max 50 pages per PDF (memory guard)
 ```
@@ -98,7 +100,8 @@ PDF Upload
 | Vision (per page) | google/gemini-3-flash-preview | ~$0.002/page |
 | Declaration + Items + QA | google/gemini-3-flash-preview | ~$0.02 |
 | Verifier | anthropic/claude-sonnet-4-6 | ~$0.12 |
-| **Total** | | **~$0.14-0.18/PDF** |
+| Fee Verifier | google/gemini-3-flash-preview | ~$0.002 |
+| **Total** | | **~$0.15-0.20/PDF** |
 
 ## Key Design Principles
 
@@ -107,27 +110,35 @@ PDF Upload
 - **json_schema enforced** — guarantees valid JSON, all required fields present
 - **Token optimized** — deduplicated fields, no metadata/visual/entities sent to assembler
 - **Correction Memory** — user corrections feed back as few-shot examples
+- **Fee self-learning** — user corrections auto-save fee baselines per importer
 - **Per-job isolation** — each job gets own files, own cost tracker, no global state
 - **Memory cleanup** — image data freed after verifier step
-- **Fee shift correction** — deterministic post-verifier fix for LLM fee field shifting (see below)
+- **Fee verification** — text LLM verifies fee mapping + 7-layer deterministic fallback (see below)
 
-## Fee Shift Correction (Step 10)
+## Fee Verification (Step 12)
 
-LLMs (both Gemini and Claude) consistently shift fee/tax values down by 1 position when reading Myanmar customs documents:
+LLMs consistently shift fee/tax values down by 1 position when reading Myanmar customs documents:
 - CT→AT, SF→MF, MF→Exemption (CT and SF become 0)
 
-This happens at every pipeline layer (vision, assembler, verifier) because the document layout confuses the models.
+**Primary fix:** `verify_fees_with_llm()` — a TEXT-BASED LLM call (no images, ~$0.002) that reads the raw vision output and matches fee labels to values. The vision agent reads labels correctly ("Security: 0", "Commercial Tax: 93,794") — the shift happens in the assembler mapping. Text-based verification avoids the visual layout confusion entirely.
 
-**Fix:** Deterministic post-verifier correction in `assembler.py:_fix_fee_shift()`:
-1. Detects 4 shift patterns (standard, SF-only, size-based, full rotation)
-2. Applies shift-back: CT=AT, AT=0, SF=MF, MF=Exemption, Exemption=0
-3. Runs AFTER verifier in both `pipeline.py` AND `ws.py` (so verifier can't overwrite)
-4. Zero LLM calls — 100% deterministic, can't re-shift
+**Fallback:** `_fix_fee_shift()` deterministic correction if LLM fee verifier fails or returns low confidence (<0.7). Has 7 safety layers:
+0. **Importer baseline** — if user corrected fees before, use verified values from `importer_profiles.fee_baseline_json`
+1. **Page text cross-check** — searches raw vision output for fee labels + values (multiple label patterns)
+2. **Pattern detection** — 4 patterns (B: SF→MF with Exempt, C: SF→MF fee-sized, A: CT→AT with corroboration, D: full rotation with AT=0)
+3. **Page text override** — blocks false positives when document confirms current values
+4. **Deterministic shift-back** — CT=AT, AT=0, SF=MF, MF=Exempt, Exempt=0
+5. **Post-fix sanity check** — reverts ALL changes if any fee exceeds customs value or CT > 5x duty
+6. **Audit trail** — logs every change to `value_audit` table with stage="fee_shift_fix"
+
+**Self-learning:** When user corrects a fee field → `corrections.py` auto-saves fee baseline to `importer_profiles.fee_baseline_json`. Future extractions for same importer use baseline as ground truth.
 
 **Don't:**
-- Don't use LLM re-calls to fix fee shifting (they shift the same way)
-- Don't move _fix_fee_shift before the verifier (verifier overwrites it)
-- Don't remove Pattern D guard (`sf_shifted` must also be true) — causes false positives
+- Don't use vision/images for fee verification — text avoids layout confusion and is 10x cheaper
+- Don't skip deterministic fallback — LLM verifier may fail or return low confidence
+- Don't remove importer baseline — it's the most reliable signal (human-verified)
+- Don't let Pattern A (CT shift) fire standalone — requires `sf_shifted or sf == 0` corroboration
+- Don't remove post-fix sanity check — it auto-reverts impossible values
 
 ## Output Tables — Column Definitions
 
@@ -169,11 +180,11 @@ If one is missing, the other is copied as fallback so both columns always have a
 | Currency 2 | currency_2 | Assembler (fallback: Currency) |
 | Customs Value | total_customs_value | Assembler |
 | Duty | import_export_customs_duty | Assembler |
-| Tax (CT) | commercial_tax_ct | Assembler + fee shift fix |
-| Income Tax (AT) | advance_income_tax_at | Assembler + fee shift fix |
-| Security (SF) | security_fee_sf | Assembler + fee shift fix |
-| MACCS (MF) | maccs_service_fee_mf | Assembler + fee shift fix |
-| Exemption | exemption_reduction | Assembler + fee shift fix |
+| Tax (CT) | commercial_tax_ct | Fee verifier / assembler |
+| Income Tax (AT) | advance_income_tax_at | Fee verifier / assembler |
+| Security (SF) | security_fee_sf | Fee verifier / assembler |
+| MACCS (MF) | maccs_service_fee_mf | Fee verifier / assembler |
+| Exemption | exemption_reduction | Fee verifier / assembler |
 | Processed | created_at | Auto-generated |
 
 **All 3 Excel exports (per-job, all-items, all-declarations) match these columns.**
@@ -220,8 +231,9 @@ cp .env.example .env   # Fill in OPENROUTER_API_KEY + JWT_SECRET_KEY
 - Don't mutate `$state` array entries in-place for view transitions — replace with new object
 - Don't convert Declaration No to float — it's a string field (see STRING_FIELDS in assembler.py)
 - Don't save Currency 2 with key `Currency.1` — the assembler uses `Currency 2`
-- Don't use LLM calls to fix fee shifting — they shift the same way every time
-- Don't put _fix_fee_shift before verifier — verifier overwrites it
+- Don't use vision/images for fee verification — text-based avoids layout confusion and is 10x cheaper
+- Don't skip deterministic fee fallback — LLM verifier may return low confidence
+- Don't let Pattern A (CT shift) fire without corroboration from SF shift
 - Don't define columns in only one place — sync UI, Excel exports, and API schemas together
 
 ## Known Issues & Troubleshooting
@@ -268,6 +280,12 @@ debugMsg = `text: ${text.length} chars`;
 **Symptom:** 401 Unauthorized on some API calls. Works in curl but not browser.
 **Root cause:** FastAPI routes with trailing slash (`/users/`) redirect requests without slash (`/users`) with 307. Browser strips `Authorization` header on redirect.
 **Fix:** Match frontend API paths exactly to backend route definitions (include trailing slash where defined).
+
+### 6. Fee values shifted (CT/AT/SF/MF wrong)
+
+**Symptom:** CT=0 but AT has CT's value, or SF=0 but MF has SF's value.
+**Root cause:** LLMs shift fee values down by 1 position due to Myanmar customs document layout.
+**Fix:** Step 12 fee verification: text-based LLM verifies mapping using raw vision labels, with 7-layer deterministic fallback. Self-learns per importer after user corrections.
 
 ## Debugging Checklist
 

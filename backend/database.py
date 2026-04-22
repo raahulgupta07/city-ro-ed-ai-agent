@@ -360,6 +360,12 @@ def init_database():
             updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     """)
+    # Add fee_baseline_json column if not exists (migration-safe)
+    try:
+        cursor.execute("ALTER TABLE importer_profiles ADD COLUMN fee_baseline_json TEXT DEFAULT NULL")
+    except Exception:
+        pass  # Column already exists
+
     try:
         cursor.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_importer_normalized ON importer_profiles(importer_name_normalized)")
     except Exception:
@@ -1841,6 +1847,47 @@ def get_weak_fields(importer_name: str, min_error_rate: float = 0.3) -> List[str
         if total > 0 and corrections / total >= min_error_rate:
             weak.append(field)
     return weak
+
+
+def get_fee_baseline(importer_name: str) -> dict:
+    """Get verified fee baseline for an importer.
+    Returns dict like {"SF": 20000, "MF": 30000, "CT_zero_ok": True} or empty dict.
+    """
+    norm = _normalize_importer(importer_name)
+    if not norm:
+        return {}
+    conn = _connect()
+    row = conn.execute(
+        "SELECT fee_baseline_json FROM importer_profiles WHERE importer_name_normalized = ?",
+        (norm,)
+    ).fetchone()
+    conn.close()
+    if row and row[0]:
+        try:
+            import json
+            return json.loads(row[0])
+        except Exception:
+            pass
+    return {}
+
+
+def save_fee_baseline(importer_name: str, fee_baseline: dict):
+    """Save verified fee baseline for an importer.
+    Called after user corrections or after successful extraction with no corrections.
+    fee_baseline: {"SF": 20000, "MF": 30000, "CT": 0, "AT": 2608987, ...}
+    """
+    norm = _normalize_importer(importer_name)
+    if not norm or not fee_baseline:
+        return
+    import json
+    baseline_json = json.dumps(fee_baseline)
+    conn = _connect()
+    conn.execute("""
+        UPDATE importer_profiles SET fee_baseline_json = ?, updated_at = datetime('now')
+        WHERE importer_name_normalized = ?
+    """, (baseline_json, norm))
+    conn.commit()
+    conn.close()
 
 
 def save_value_audit(job_id: str, table_key: str, field_key: str,
