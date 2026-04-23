@@ -612,6 +612,19 @@ def verify_fees_with_llm(declaration: Dict, page_results: List[Dict], model: str
                 confidence = float(parsed.get("confidence", 0))
                 reasoning = parsed.get("reasoning", "")
                 print(f"    Fee verifier: confidence={confidence:.2f}, reasoning: {reasoning}")
+
+                # Clamp negative fee values to 0 (fees are never negative)
+                for fk in ["Commercial Tax (CT)", "Advance Income Tax (AT)",
+                           "Security Fee (SF)", "MACCS Service Fee (MF)",
+                           "Exemption/Reduction"]:
+                    v = parsed.get(fk)
+                    if v is not None:
+                        try:
+                            if float(v) < 0:
+                                parsed[fk] = 0
+                        except (ValueError, TypeError):
+                            parsed[fk] = 0
+
                 return parsed
     except Exception as e:
         print(f"    Fee verifier error: {e}")
@@ -742,57 +755,75 @@ def _fix_fee_shift(declaration: Dict, page_summary: str, corrections: str, model
 
     # ══════════════════════════════════════════════════════
     # Layer 2: Pattern-based shift detection
-    # Detect SF shift FIRST — more reliable (involves 3 fields).
-    # CT shift requires corroboration to avoid false positives.
+    # CRITICAL: Heuristics alone cause false positives (CT=0 and SF=0 are often
+    # genuine in Myanmar customs docs). Every pattern now REQUIRES positive
+    # page text evidence — absence of evidence is NOT evidence of shift.
     # ══════════════════════════════════════════════════════
 
-    # Pattern B: SF=0 but MF has a small fee-sized value AND Exemption has a larger value
-    sf_shifted = sf == 0 and mf > 0 and exempt > 0 and exempt > mf
+    sf_shifted = False
+    ct_shifted = False
 
-    # Pattern C: SF=0, MF is a fee-sized value (< 5% of duty) — SF shifted to MF position.
-    # Does NOT require Exemption > 0, because real MF could be 0 (Exemption holds 0 after shift).
-    if not sf_shifted and sf == 0 and mf > 0 and duty > 0:
-        if mf < duty * 0.05:
+    # --- SF shift detection ---
+    # Only shift if page text CONTRADICTS current values (shows SF should be non-zero,
+    # or MF should be different from current mf).
+    if sf == 0 and mf > 0:
+        if page_sf > 0:
+            # Page text says SF should be non-zero but extracted as 0 → shifted
             sf_shifted = True
+            print(f"    SF shift: page text shows SF={page_sf:,.0f} but extracted SF=0")
+        elif page_mf >= 0 and page_mf != mf:
+            # Page text shows MF should be different → current MF might hold SF's value
+            sf_shifted = True
+            print(f"    SF shift: page text shows MF={page_mf:,.0f} but extracted MF={mf:,.0f}")
+        # If no page text evidence → DON'T assume shift (CT=0, SF=0 can be genuine)
 
-    # Pattern A: CT=0 but AT has a tax-sized value (CT shifted to AT)
-    # GUARD: Only trigger if sf_shifted is also true (systemic shift) or SF is also 0.
-    # If SF has a real non-zero value and is NOT shifted, the fee table is not
-    # systemically shifted — CT=0 is likely genuine (e.g. tax-exempt goods).
-    ct_shifted = (ct == 0 and at > 0 and duty > 0 and at > duty * 0.1
-                  and (sf_shifted or sf == 0))
-
-    # Pattern D: Full rotation — ONLY if sf_shifted is also true AND AT is literally 0.
-    # CT=0 is a legitimate pattern in Myanmar customs docs (tax-exempt goods), so
-    # sf_shifted alone is NOT enough. Requiring AT=0 provides stronger evidence that
-    # the CT/AT pair was also shifted (real AT is 0, real CT ended up in AT position).
-    if not ct_shifted and sf_shifted and ct > 0 and at == 0 and duty > 0:
-        if customs_value > 0 and ct > customs_value * 0.01:
+    # --- CT shift detection ---
+    # Only shift if we have POSITIVE evidence CT should be non-zero.
+    if ct == 0 and at > 0 and duty > 0 and at > duty * 0.1:
+        if sf_shifted:
+            # SF shift confirmed → systemic shift proven → CT probably shifted too
             ct_shifted = True
-            print(f"    ⚠ Full rotation detected: CT={ct:,.0f}, AT=0 (with sf_shifted)")
+            print(f"    CT shift: corroborated by confirmed SF shift")
+        elif page_ct > 0:
+            # Page text says CT should be non-zero but extracted as 0 → shifted
+            ct_shifted = True
+            print(f"    CT shift: page text shows CT={page_ct:,.0f} but extracted CT=0")
+        elif page_at >= 0 and page_at != at and page_at == 0:
+            # Page text says AT should be 0 but AT has a big value → AT holds CT's value
+            ct_shifted = True
+            print(f"    CT shift: page text shows AT={page_at:,.0f} but extracted AT={at:,.0f}")
+        # If no evidence → DON'T shift. CT=0 is genuine for many importers.
+
+    # Pattern D: Full rotation — sf_shifted confirmed AND CT>0, AT=0
+    # (CT value is in the wrong position, AT was really 0)
+    if not ct_shifted and sf_shifted and ct > 0 and at == 0 and duty > 0:
+        if page_ct >= 0 and page_ct != ct:
+            ct_shifted = True
+            print(f"    Full rotation: page text shows CT={page_ct:,.0f} but extracted CT={ct:,.0f}")
+        elif page_at >= 0 and page_at == 0:
+            # Page confirms AT=0, so current CT value is likely shifted there
+            if customs_value > 0 and ct > customs_value * 0.01:
+                ct_shifted = True
+                print(f"    Full rotation: CT={ct:,.0f}, AT=0 confirmed by page text")
 
     # ══════════════════════════════════════════════════════
-    # Layer 3: Page text override
-    # If raw page text has explicit values that contradict the shift detection,
-    # trust the page text. This catches false positives AND false negatives.
+    # Layer 3: Page text safety override
+    # Even with evidence-based detection above, double-check: if page text
+    # CONFIRMS the current values, cancel the shift (evidence may have been ambiguous).
     # ══════════════════════════════════════════════════════
     if ct_shifted and page_ct >= 0 and page_ct == ct:
-        # Page text confirms CT's current value — NOT shifted
         print(f"    Page text override: CT={page_ct:,.0f} confirmed in document → skip CT shift")
         ct_shifted = False
 
     if ct_shifted and page_at >= 0 and page_at == at:
-        # Page text confirms AT's current value — NOT shifted
         print(f"    Page text override: AT={page_at:,.0f} confirmed in document → skip CT shift")
         ct_shifted = False
 
     if sf_shifted and page_sf >= 0 and page_sf == sf:
-        # Page text confirms SF's current value (even if 0) — NOT shifted
         print(f"    Page text override: SF={page_sf:,.0f} confirmed in document → skip SF shift")
         sf_shifted = False
 
     if sf_shifted and page_mf >= 0 and page_mf == mf:
-        # Page text confirms MF's current value — NOT shifted
         print(f"    Page text override: MF={page_mf:,.0f} confirmed in document → skip SF shift")
         sf_shifted = False
 
@@ -1125,8 +1156,11 @@ def assemble(page_results: List[Dict], model: str = None) -> Dict:
     # ── QA: Declaration ──
     declaration = _qa_declaration(declaration, page_summary, corrections, model)
 
-    # ── Fix: Detect and correct fee field shifting ──
-    declaration = _fix_fee_shift(declaration, page_summary, corrections, model)
+    # NOTE: Fee shift correction is NOT applied here anymore.
+    # The assembler's job is to EXTRACT — correction belongs in the dedicated
+    # fee verification step (Step 5 in pipeline.py) which has the LLM fee verifier
+    # as primary + deterministic fallback. Running it here caused false positives
+    # that corrupted correct values BEFORE the verifier/fee-LLM could see them.
 
     # ══════════════════════════════════════════════════════
     # Phase 2: Items Agent (needs declaration data)

@@ -117,27 +117,57 @@ PDF Upload
 
 ## Fee Verification (Step 12)
 
-LLMs consistently shift fee/tax values down by 1 position when reading Myanmar customs documents:
+LLMs can shift fee/tax values down by 1 position when reading Myanmar customs documents:
 - CT→AT, SF→MF, MF→Exemption (CT and SF become 0)
 
-**Primary fix:** `verify_fees_with_llm()` — a TEXT-BASED LLM call (no images, ~$0.002) that reads the raw vision output and matches fee labels to values. The vision agent reads labels correctly ("Security: 0", "Commercial Tax: 93,794") — the shift happens in the assembler mapping. Text-based verification avoids the visual layout confusion entirely.
+However, CT=0 and SF=0 are **often genuine** (tax-exempt goods, certain importers). The fix must not over-correct.
 
-**Fallback:** `_fix_fee_shift()` deterministic correction if LLM fee verifier fails or returns low confidence (<0.7). Has 7 safety layers:
-0. **Importer baseline** — if user corrected fees before, use verified values from `importer_profiles.fee_baseline_json`
-1. **Page text cross-check** — searches raw vision output for fee labels + values (multiple label patterns)
-2. **Pattern detection** — 4 patterns (B: SF→MF with Exempt, C: SF→MF fee-sized, A: CT→AT with corroboration, D: full rotation with AT=0)
-3. **Page text override** — blocks false positives when document confirms current values
+### Defense Chain (5 layers)
+
+```
+Assembler extracts fees (NO correction applied — assembler only extracts)
+  → Verifier (Claude Sonnet) cross-checks against page images
+  → Fee LLM Verifier (PRIMARY) — text-based, ~$0.002, confidence scored
+      ├─ confidence ≥ 0.7 → sanity check → apply (or reject if insane)
+      └─ confidence < 0.7 or failed → deterministic fallback
+          ├─ page text evidence found → correct shift
+          └─ no evidence → leave values untouched (safe default)
+  → Final safety net: if any fee > customs value → revert ALL to assembler original
+```
+
+**Primary:** `verify_fees_with_llm()` — TEXT-BASED LLM call (no images) reads raw vision output and matches fee labels to values. Avoids the visual layout confusion that causes shifting. Returns confidence score.
+
+**Sanity checks on LLM output (pipeline.py):**
+- No fee may exceed customs value
+- CT must not exceed 5x duty
+- Negative values clamped to 0
+- If sanity fails → fall through to deterministic
+
+**Fallback:** `_fix_fee_shift()` — conservative deterministic correction. **Requires positive page text evidence** for every pattern. 7 safety layers:
+0. **Importer baseline** — verified values from past user corrections
+1. **Page text cross-check** — regex search for fee labels + values in raw vision output
+2. **Evidence-based pattern detection** — patterns ONLY fire with page text proof:
+   - SF shift: requires page text showing SF > 0 or MF ≠ current value
+   - CT shift: requires confirmed SF shift (systemic) OR page text showing CT > 0
+   - Without evidence → no shift applied (safe default)
+3. **Page text safety override** — cancels shift if page text confirms current values
 4. **Deterministic shift-back** — CT=AT, AT=0, SF=MF, MF=Exempt, Exempt=0
 5. **Post-fix sanity check** — reverts ALL changes if any fee exceeds customs value or CT > 5x duty
-6. **Audit trail** — logs every change to `value_audit` table with stage="fee_shift_fix"
+6. **Audit trail** — logs every change to `value_audit` table
+
+**Final safety net (pipeline.py):** If deterministic fallback produces any fee > customs value, ALL fee changes are reverted to the assembler's original extraction.
 
 **Self-learning:** When user corrects a fee field → `corrections.py` auto-saves fee baseline to `importer_profiles.fee_baseline_json`. Future extractions for same importer use baseline as ground truth.
 
+**Tested:** 13/13 PDFs pass, 2/2 verified against ground truth with 100% fee accuracy. Fee LLM confidence=1.00 on all 13.
+
 **Don't:**
 - Don't use vision/images for fee verification — text avoids layout confusion and is 10x cheaper
-- Don't skip deterministic fallback — LLM verifier may fail or return low confidence
+- Don't apply `_fix_fee_shift()` inside `assemble()` — assembler only extracts, correction belongs in Step 5
+- Don't fire Pattern A/B/C on heuristics alone — requires page text evidence (CT=0 and SF=0 are often genuine)
+- Don't trust LLM fee output without sanity checks — validate before applying
+- Don't remove the final safety net — it auto-reverts impossible values to assembler original
 - Don't remove importer baseline — it's the most reliable signal (human-verified)
-- Don't let Pattern A (CT shift) fire standalone — requires `sf_shifted or sf == 0` corroboration
 - Don't remove post-fix sanity check — it auto-reverts impossible values
 
 ## Output Tables — Column Definitions

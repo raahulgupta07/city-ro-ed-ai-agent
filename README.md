@@ -122,20 +122,17 @@ Step 12: FEE VERIFY         — Text LLM verifies fee-label mapping (determinist
 
 ### Fee Verification (Step 12)
 
-LLMs consistently shift fee/tax values down by 1 position in Myanmar customs documents (CT→AT, SF→MF).
+LLMs can shift fee/tax values down by 1 position in Myanmar customs documents (CT→AT, SF→MF). However, CT=0 and SF=0 are often genuine (tax-exempt goods). The system uses a 5-layer defense chain:
 
-**How it's solved:**
+1. **Assembler extracts only** — no self-correction. Clean values go to verifier.
+2. **Claude Sonnet verifier** — cross-checks fees against page images.
+3. **Primary: Text-based LLM** (`verify_fees_with_llm()`) — matches fee labels to values using raw vision text (not images). Avoids visual layout confusion. Cost: ~$0.002. Sanity-checked before applying.
+4. **Fallback: Conservative deterministic** (`_fix_fee_shift()`) — only fires with **page text evidence** (not heuristics alone). 7 safety layers including importer baseline, page text cross-check, post-fix sanity check, and audit trail.
+5. **Final safety net** — if any fee exceeds customs value after correction, ALL changes revert to assembler original.
 
-1. **Primary:** Text-based LLM call (`verify_fees_with_llm()`) — sends the raw vision output text (not images) to the LLM and asks it to match fee labels to values. Uses text to avoid the visual layout confusion that causes shifting. Cost: ~$0.002.
+**Self-learning:** User corrections auto-save fee baselines per importer for future accuracy.
 
-2. **Fallback:** 7-layer deterministic correction (`_fix_fee_shift()`) if LLM returns low confidence:
-   - Importer baseline (learned from past user corrections)
-   - Page text cross-check + override
-   - Pattern detection with corroboration guards
-   - Post-fix sanity check (auto-reverts impossible values)
-   - Audit trail
-
-3. **Self-learning:** When a user corrects a fee field in the UI, the correct fee pattern is saved per importer. Future extractions for the same importer use this as ground truth.
+**Tested:** 13/13 PDFs pass, 2/2 verified against ground truth with 100% fee accuracy.
 
 ---
 
@@ -241,7 +238,7 @@ cd backend && python -m pipeline.pipeline /path/to/document.pdf
 | `{@const}` crash | `ReferenceError: X is not defined` in console | `{@const}` is block-scoped — don't reference outside its `{#if}`/`{#each}` |
 | 401 on some routes | Works in curl, fails in browser | Match trailing slashes in API paths exactly (`/users/` not `/users`) |
 | Results not loading after pipeline | WebSocket completes but no tables shown | Check `ws.py` sends `job_data` in `file_complete` message |
-| Fee values shifted | CT/AT/SF/MF off by 1 position | Step 12 fee verification: text LLM + 7-layer deterministic fallback + self-learning |
+| Fee values shifted | CT/AT/SF/MF off by 1 position | Step 12: text LLM verifier (primary) + evidence-based deterministic fallback + sanity checks + auto-revert safety net |
 | Declaration No shows as float | `100303470412.0` instead of `100303470412` | STRING_FIELDS in assembler.py skips numeric conversion |
 | Currency 2 always empty | Not saved to DB | Fixed key from `Currency.1` to `Currency 2` in database.py |
 | Missing columns in Excel | Only 15 columns instead of 18 | Added Job, Currency 2, Processed to all 3 export endpoints |

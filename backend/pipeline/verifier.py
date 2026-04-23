@@ -153,7 +153,11 @@ def verify(declaration: Dict, items: List[Dict], pages: List[Dict],
 
                 # Validate response structure before accessing
                 if "choices" not in result or not result["choices"]:
-                    print(f"    Verifier: malformed API response (no 'choices' key)")
+                    # Log actual response for debugging (truncate to avoid spam)
+                    err_msg = result.get("error", {})
+                    if isinstance(err_msg, dict):
+                        err_msg = err_msg.get("message", str(result)[:200])
+                    print(f"    Verifier: malformed API response — {str(err_msg)[:200]}")
                     if attempt < 2:
                         time.sleep(2 ** (attempt + 1))
                     continue

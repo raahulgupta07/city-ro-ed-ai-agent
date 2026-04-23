@@ -98,40 +98,79 @@ def run_pipeline(
     # ═══ Step 5: Fee verification — LLM text-based (primary) + deterministic (fallback) ═══
     from pipeline.assembler import verify_fees_with_llm, _fix_fee_shift, _build_page_summary
 
+    fee_fields = ["Commercial Tax (CT)", "Advance Income Tax (AT)",
+                  "Security Fee (SF)", "MACCS Service Fee (MF)", "Exemption/Reduction"]
+
+    # Save assembler's original fee values — if everything else fails, these are our baseline
+    original_fees = {f: declaration.get(f, 0) or 0 for f in fee_fields}
+
     # Primary: Focused text LLM call to verify fee mapping using raw page data
     _log("Step 5: Verifying fee field mapping...")
     fee_result = verify_fees_with_llm(declaration, page_results)
-
-    fee_fields = ["Commercial Tax (CT)", "Advance Income Tax (AT)",
-                  "Security Fee (SF)", "MACCS Service Fee (MF)", "Exemption/Reduction"]
     fee_confidence = float(fee_result.get("confidence", 0)) if fee_result else 0
 
+    fee_applied = False
     if fee_result and fee_confidence >= 0.7:
-        # LLM fee verification succeeded with good confidence — apply its values
-        changes = []
+        # ── Sanity check LLM output before applying ──
+        customs_value = float(declaration.get("Total Customs Value", 0) or 0)
+        duty = float(declaration.get("Import/Export Customs Duty", 0) or 0)
+        sane = True
         for field in fee_fields:
-            new_val = fee_result.get(field)
-            if new_val is not None:
-                old_val = declaration.get(field, 0) or 0
-                try:
-                    new_val = float(new_val)
-                except (ValueError, TypeError):
-                    continue
-                if abs(float(old_val or 0) - new_val) > 0.01:
-                    changes.append((field, old_val, new_val))
-                declaration[field] = new_val
+            try:
+                val = float(fee_result.get(field, 0) or 0)
+            except (ValueError, TypeError):
+                val = 0
+            # No fee should exceed customs value
+            if customs_value > 0 and val > customs_value:
+                _log(f"  ⚠ Fee LLM sanity fail: {field}={val:,.0f} > customs_value={customs_value:,.0f}")
+                sane = False
+            # CT should not be absurdly large vs duty
+            if field == "Commercial Tax (CT)" and duty > 0 and val > duty * 5:
+                _log(f"  ⚠ Fee LLM sanity fail: CT={val:,.0f} > 5x duty={duty:,.0f}")
+                sane = False
 
-        if changes:
-            _log(f"Fee verifier corrected {len(changes)} fields (confidence={fee_confidence:.2f}):")
-            for field, old_val, new_val in changes:
-                _log(f"  {field}: {old_val} → {new_val}")
+        if sane:
+            # Apply LLM-verified values
+            changes = []
+            for field in fee_fields:
+                new_val = fee_result.get(field)
+                if new_val is not None:
+                    old_val = declaration.get(field, 0) or 0
+                    try:
+                        new_val = float(new_val)
+                    except (ValueError, TypeError):
+                        continue
+                    if abs(float(old_val or 0) - new_val) > 0.01:
+                        changes.append((field, old_val, new_val))
+                    declaration[field] = new_val
+
+            fee_applied = True
+            if changes:
+                _log(f"Fee verifier corrected {len(changes)} fields (confidence={fee_confidence:.2f}):")
+                for field, old_val, new_val in changes:
+                    _log(f"  {field}: {old_val} → {new_val}")
+            else:
+                _log(f"Fee verifier confirmed all values correct (confidence={fee_confidence:.2f})")
         else:
-            _log(f"Fee verifier confirmed all values correct (confidence={fee_confidence:.2f})")
-    else:
-        # Fallback: deterministic correction
-        _log("Fee verifier unavailable or low confidence — using deterministic fallback")
+            _log(f"Fee verifier output failed sanity check — ignoring LLM result")
+
+    if not fee_applied:
+        # Fallback: conservative deterministic correction (requires page text evidence)
+        _log("Fee verifier unavailable or failed — using deterministic fallback")
         page_summary = _build_page_summary(page_results)
-        declaration = _fix_fee_shift(declaration, page_summary, "", None)
+        declaration = _fix_fee_shift(declaration, page_summary, "", None, job_id=None)
+
+        # ── Final safety net: if deterministic made fees WORSE, revert to assembler original ──
+        customs_value = float(declaration.get("Total Customs Value", 0) or 0)
+        if customs_value > 0:
+            for field in fee_fields:
+                val = float(declaration.get(field, 0) or 0)
+                if val > customs_value:
+                    _log(f"  ⚠ Reverting ALL fee changes — {field}={val:,.0f} exceeds customs value")
+                    for f in fee_fields:
+                        declaration[f] = original_fees[f]
+                    _log(f"  Fees restored to assembler values: {original_fees}")
+                    break
 
     # ═══ Compute accuracy ═══
     total_fields = filled + sum(sum(1 for v in item.values() if v is not None) for item in items)
